@@ -15,6 +15,8 @@ Usage:
     python striim_export_all_with_checkpoint.py --environment production
     python striim_export_all_with_checkpoint.py --passphrase "custom123"
     python striim_export_all_with_checkpoint.py --droptypes admin MySource
+    python striim_export_all_with_checkpoint.py --droptypes  # Auto-detect from apps
+    python striim_export_all_with_checkpoint.py --droptypes-auto  # Alternative auto-detect
 """
 
 import requests
@@ -179,6 +181,50 @@ class StriimAPI:
         print(f"  Failed to drop: {failed_count}")
 
         return failed_count == 0
+
+    def auto_drop_types_for_checkpoint_apps(self, app_names: List[str]) -> bool:
+        """Automatically drop types for applications that will have checkpoint data"""
+        print("Auto-detecting source components from applications with checkpoint data...")
+
+        # We'll collect unique source components to avoid duplicate drops
+        source_components = set()
+
+        # For each app, try to extract the source component name
+        for app_name in app_names:
+            # Application names are typically in format: namespace.source_component_name
+            # Examples: admin.SQLCDCReader, admin.MySQLReader_Production, etc.
+            if '.' in app_name:
+                parts = app_name.split('.')
+                if len(parts) >= 2:
+                    namespace = parts[0]
+                    # The source component might have underscores, so join remaining parts
+                    source_component = '.'.join(parts[1:])
+
+                    # Remove common suffixes that might be added to app names
+                    for suffix in ['_App', '_Application', '_Stream']:
+                        if source_component.endswith(suffix):
+                            source_component = source_component[:-len(suffix)]
+                            break
+
+                    source_components.add((namespace, source_component))
+                    print(f"  Detected source component: {namespace}.{source_component}")
+
+        if not source_components:
+            print("  No source components detected from application names")
+            return True
+
+        print(f"\nFound {len(source_components)} unique source components to process")
+
+        # Drop types for each detected source component
+        overall_success = True
+        for namespace, source_component in source_components:
+            print(f"\nProcessing source component: {namespace}.{source_component}")
+            success = self.drop_types_by_prefix(namespace, source_component)
+            if not success:
+                overall_success = False
+                print(f"⚠️  Failed to drop some types for {namespace}.{source_component}")
+
+        return overall_success
 
     def export_all_applications(self, export_path: str, passphrase: str = None) -> bool:
         """Export all applications to a zip file using EXPORT APPLICATION ALL"""
@@ -504,8 +550,10 @@ def main():
                        help=f'Passphrase for export encryption (default: {default_config["passphrase"]})')
     parser.add_argument('--environment', choices=['default'] + list(config.ENVIRONMENTS.keys()),
                        default='default', help='Environment configuration to use')
-    parser.add_argument('--droptypes', nargs=2, metavar=('NAMESPACE', 'SOURCE_COMPONENT_NAME'),
-                       help='Drop all types matching the given namespace and source component name prefix (format: namespace.source_component_name_*)')
+    parser.add_argument('--droptypes', nargs='*', metavar=('NAMESPACE', 'SOURCE_COMPONENT_NAME'),
+                       help='Drop types. Usage: --droptypes (auto-detect from apps with checkpoints) or --droptypes NAMESPACE SOURCE_COMPONENT_NAME (explicit)')
+    parser.add_argument('--droptypes-auto', action='store_true',
+                       help='Automatically drop types for all applications with checkpoint data (alternative to --droptypes with no args)')
 
     args = parser.parse_args()
 
@@ -525,9 +573,12 @@ def main():
     print("🚀 Starting Striim Export All with Checkpoint Position Updater")
     print(f"   Striim URL: {args.url}")
     print(f"   Stage Directory: {args.stage_dir}")
-    if args.droptypes:
-        namespace, source_component_name = args.droptypes
-        print(f"   Drop Types Prefix: {namespace}.{source_component_name}_")
+    if args.droptypes is not None or args.droptypes_auto:
+        if args.droptypes_auto or (args.droptypes is not None and len(args.droptypes) == 0):
+            print(f"   Drop Types Mode: Auto-detection")
+        elif args.droptypes and len(args.droptypes) == 2:
+            namespace, source_component_name = args.droptypes
+            print(f"   Drop Types Prefix: {namespace}.{source_component_name}_")
     print()
     
     # Initialize API client
@@ -539,22 +590,34 @@ def main():
         sys.exit(1)
     print()
 
-    # Optional: Drop types if requested
-    if args.droptypes:
-        namespace, source_component_name = args.droptypes
-        print(f"Step 1.5: Dropping types with prefix {namespace}.{source_component_name}_...")
-        if not api.drop_types_by_prefix(namespace, source_component_name):
-            print("⚠️  Some types failed to drop, but continuing with export...")
-        print()
-
-    # Step 2: Get application list
+    # Step 2: Get application list (moved up to support auto-drop-types)
     print("Step 2: Getting application list...")
     app_names = get_application_list(api)
     if not app_names:
         print("✗ No applications found. Exiting.")
         sys.exit(1)
     print()
-    
+
+    # Optional: Drop types if requested
+    if args.droptypes is not None or args.droptypes_auto:
+        print("Step 2.5: Dropping types...")
+
+        if args.droptypes_auto or (args.droptypes is not None and len(args.droptypes) == 0):
+            # Auto-detection mode
+            print("Using auto-detection mode...")
+            if not api.auto_drop_types_for_checkpoint_apps(app_names):
+                print("⚠️  Some types failed to drop, but continuing with export...")
+        elif args.droptypes and len(args.droptypes) == 2:
+            # Explicit mode
+            namespace, source_component_name = args.droptypes
+            print(f"Using explicit mode: {namespace}.{source_component_name}_...")
+            if not api.drop_types_by_prefix(namespace, source_component_name):
+                print("⚠️  Some types failed to drop, but continuing with export...")
+        else:
+            print("✗ Invalid --droptypes usage. Use --droptypes (auto) or --droptypes NAMESPACE SOURCE_COMPONENT_NAME")
+            sys.exit(1)
+        print()
+
     # Step 3: Export all applications using bulk export
     print("Step 3: Exporting all applications...")
 
