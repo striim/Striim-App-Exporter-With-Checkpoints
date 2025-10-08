@@ -43,7 +43,7 @@ STRIIM_CONFIG = {
 
 The tool supports multiple environments:
 
-- **default**: Uses `STRIIM_CONFIG` values
+- **default**: Uses `STRIIM_CONFIG_EXPORT` values for exporter
 - **development**: Development environment settings
 - **staging**: Staging environment settings  
 - **production**: Production environment settings
