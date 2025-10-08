@@ -185,35 +185,74 @@ class StriimAPI:
 
         return failed_count == 0
 
-    def auto_drop_types_for_checkpoint_apps(self, app_names: List[str]) -> bool:
+    def extract_source_names_from_tql(self, tql_file_path: str) -> List[str]:
+        """Extract source names from a TQL file"""
+        source_names = []
+        try:
+            with open(tql_file_path, 'r') as f:
+                content = f.read()
+
+            # Look for CREATE SOURCE patterns
+            # Pattern: CREATE [OR REPLACE] SOURCE source_name USING ...
+            import re
+            pattern = r'CREATE\s+(?:OR\s+REPLACE\s+)?SOURCE\s+(\w+)\s+USING'
+            matches = re.findall(pattern, content, re.IGNORECASE)
+            source_names.extend(matches)
+
+        except Exception as e:
+            print(f"    ⚠️  Error reading TQL file {tql_file_path}: {e}")
+
+        return source_names
+
+    def auto_drop_types_for_checkpoint_apps(self, app_names: List[str], exported_files: Dict[str, str] = None) -> bool:
         """Automatically drop types for applications that will have checkpoint data"""
-        print("Auto-detecting source components from applications with checkpoint data...")
+        print("Auto-detecting source components from TQL files...")
 
         # We'll collect unique source components to avoid duplicate drops
         source_components = set()
 
-        # For each app, try to extract the source component name
-        for app_name in app_names:
-            # Application names are typically in format: namespace.source_component_name
-            # Examples: admin.SQLCDCReader, admin.MySQLReader_Production, etc.
-            if '.' in app_name:
-                parts = app_name.split('.')
-                if len(parts) >= 2:
-                    namespace = parts[0]
-                    # The source component might have underscores, so join remaining parts
-                    source_component = '.'.join(parts[1:])
+        # If we have exported files, use them; otherwise we need to work with app names only
+        if exported_files:
+            print("Using exported TQL files for accurate source detection...")
 
-                    # Remove common suffixes that might be added to app names
-                    for suffix in ['_App', '_Application', '_Stream']:
-                        if source_component.endswith(suffix):
-                            source_component = source_component[:-len(suffix)]
-                            break
+            for app_name, tql_file in exported_files.items():
+                # Extract namespace from app name
+                if '.' in app_name:
+                    namespace = app_name.split('.')[0]
 
-                    source_components.add((namespace, source_component))
-                    print(f"  Detected source component: {namespace}.{source_component}")
+                    # Extract actual source names from TQL file
+                    source_names = self.extract_source_names_from_tql(tql_file)
+
+                    for source_name in source_names:
+                        source_components.add((namespace, source_name))
+                        print(f"  Found source in {app_name}: {namespace}.{source_name}")
+                else:
+                    print(f"  ⚠️  Skipping {app_name} - no namespace found")
+        else:
+            print("Using application names for source detection (less accurate)...")
+
+            # Fallback to the old method if no exported files available
+            for app_name in app_names:
+                # Application names are typically in format: namespace.source_component_name
+                # Examples: admin.SQLCDCReader, admin.MySQLReader_Production, etc.
+                if '.' in app_name:
+                    parts = app_name.split('.')
+                    if len(parts) >= 2:
+                        namespace = parts[0]
+                        # The source component might have underscores, so join remaining parts
+                        source_component = '.'.join(parts[1:])
+
+                        # Remove common suffixes that might be added to app names
+                        for suffix in ['_App', '_Application', '_Stream']:
+                            if source_component.endswith(suffix):
+                                source_component = source_component[:-len(suffix)]
+                                break
+
+                        source_components.add((namespace, source_component))
+                        print(f"  Guessed source component: {namespace}.{source_component}")
 
         if not source_components:
-            print("  No source components detected from application names")
+            print("  No source components detected")
             return True
 
         print(f"\nFound {len(source_components)} unique source components to process")
@@ -686,24 +725,17 @@ def main():
         api.stop_and_undeploy_all_applications(app_names)
         print()
 
-    # Optional: Drop types if requested
-    if args.droptypes is not None or args.droptypes_auto:
-        print("Step 2.5: Dropping types...")
+    # We'll handle drop types after export if using auto-detection (to get accurate source names)
+    explicit_droptypes = args.droptypes and len(args.droptypes) == 2
+    auto_droptypes = args.droptypes_auto or (args.droptypes is not None and len(args.droptypes) == 0)
 
-        if args.droptypes_auto or (args.droptypes is not None and len(args.droptypes) == 0):
-            # Auto-detection mode
-            print("Using auto-detection mode...")
-            if not api.auto_drop_types_for_checkpoint_apps(app_names):
-                print("⚠️  Some types failed to drop, but continuing with export...")
-        elif args.droptypes and len(args.droptypes) == 2:
-            # Explicit mode
-            namespace, source_component_name = args.droptypes
-            print(f"Using explicit mode: {namespace}.{source_component_name}_...")
-            if not api.drop_types_by_prefix(namespace, source_component_name):
-                print("⚠️  Some types failed to drop, but continuing with export...")
-        else:
-            print("✗ Invalid --droptypes usage. Use --droptypes (auto) or --droptypes NAMESPACE SOURCE_COMPONENT_NAME")
-            sys.exit(1)
+    # Optional: Drop types if requested (explicit mode only, auto mode happens after export)
+    if explicit_droptypes:
+        print("Step 2.5: Dropping types (explicit mode)...")
+        namespace, source_component_name = args.droptypes
+        print(f"Using explicit mode: {namespace}.{source_component_name}_...")
+        if not api.drop_types_by_prefix(namespace, source_component_name):
+            print("⚠️  Some types failed to drop, but continuing with export...")
         print()
 
     # Step 3: Export all applications using bulk export
@@ -730,6 +762,14 @@ def main():
         print("✗ No applications extracted successfully. Exiting.")
         sys.exit(1)
     print()
+
+    # Optional: Drop types if requested (auto-detection mode, now that we have TQL files)
+    if auto_droptypes:
+        print("Step 3.5: Dropping types (auto-detection mode)...")
+        print("Using auto-detection mode with extracted TQL files...")
+        if not api.auto_drop_types_for_checkpoint_apps(app_names, exported_files):
+            print("⚠️  Some types failed to drop, but continuing with checkpoint processing...")
+        print()
     
     # Step 4: Process each exported application
     print("Step 4: Processing applications for checkpoint updates...")
