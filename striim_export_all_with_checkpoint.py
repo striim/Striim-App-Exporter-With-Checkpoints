@@ -4,15 +4,17 @@ Striim Export All with Checkpoint Position Updater
 
 This script:
 1. Authenticates with Striim API
-2. Gets list of all applications using 'mon;'
-3. Exports all applications using EXPORT APPLICATION ALL with passphrase
-4. Gets checkpoint history for all applications
-5. Updates TQL files with checkpoint positions (only for Global.MysqlReader and Global.MSSqlReader sources)
+2. Optionally drops types matching a namespace and source component name prefix
+3. Gets list of all applications using 'mon;'
+4. Exports all applications using EXPORT APPLICATION ALL with passphrase
+5. Gets checkpoint history for all applications
+6. Updates TQL files with checkpoint positions (only for Global.MysqlReader and Global.MSSqlReader sources)
 
 Usage:
     python striim_export_all_with_checkpoint.py
     python striim_export_all_with_checkpoint.py --environment production
     python striim_export_all_with_checkpoint.py --passphrase "custom123"
+    python striim_export_all_with_checkpoint.py --droptypes admin MySource
 """
 
 import requests
@@ -23,7 +25,7 @@ import sys
 import os
 import zipfile
 import tempfile
-from typing import Dict, Optional, Tuple, List
+from typing import Dict, Optional, List, Tuple, List
 from pathlib import Path
 import config
 
@@ -91,6 +93,93 @@ class StriimAPI:
             print(f"✗ Failed to parse response for command '{command}': {e}")
             return None
     
+    def list_types(self) -> List[str]:
+        """Get list of all types using 'list types;' command"""
+        if not self.token:
+            print("✗ Not authenticated. Call authenticate() first.")
+            return []
+
+        result = self.execute_command("list types;")
+        if not result:
+            return []
+
+        try:
+            # Parse the list types command output
+            if len(result) > 0 and 'output' in result[0]:
+                output = result[0]['output']
+
+                # The API returns a list of type objects in this format:
+                # [{"type1": {"name": "Global.MonitorBatchEvent"}}, {"type2": {"name": "Global.DataBlockEvent"}}, ...]
+                if isinstance(output, list):
+                    types = []
+                    for item in output:
+                        if isinstance(item, dict):
+                            # Each item has a key like "type1", "type2", etc. with a dict containing "name"
+                            for type_key, type_info in item.items():
+                                if isinstance(type_info, dict) and 'name' in type_info:
+                                    types.append(type_info['name'])
+                    return types
+
+            print("✗ No types found in list types output")
+            return []
+
+        except Exception as e:
+            print(f"✗ Error parsing types list: {e}")
+            return []
+
+    def drop_types_by_prefix(self, namespace: str, source_component_name: str) -> bool:
+        """Drop all types matching the given namespace and source component name prefix"""
+        if not self.token:
+            print("✗ Not authenticated. Call authenticate() first.")
+            return False
+
+        # Construct prefix pattern
+        prefix = f"{namespace}.{source_component_name}_"
+        print(f"Looking for types with prefix: {prefix}")
+
+        # Get all types
+        all_types = self.list_types()
+        if not all_types:
+            print("✗ No types found or failed to list types")
+            return False
+
+        print(f"Found {len(all_types)} total types")
+
+        # Filter types by prefix
+        matching_types = [t for t in all_types if t.startswith(prefix)]
+
+        if not matching_types:
+            print(f"No types found with prefix '{prefix}'")
+            return True  # Not an error, just nothing to drop
+
+        print(f"Types matching prefix '{prefix}':")
+        for type_name in matching_types:
+            print(f"  {type_name}")
+        print()
+
+        # Drop each matching type
+        dropped_count = 0
+        failed_count = 0
+
+        for type_name in matching_types:
+            print(f"Dropping type: {type_name}")
+            command = f"drop type {type_name};"
+            result = self.execute_command(command)
+
+            if result:
+                dropped_count += 1
+                print(f"  ✓ Successfully dropped {type_name}")
+            else:
+                failed_count += 1
+                print(f"  ✗ Failed to drop {type_name}")
+
+        print(f"\nDrop types summary:")
+        print(f"  Total matching types: {len(matching_types)}")
+        print(f"  Successfully dropped: {dropped_count}")
+        print(f"  Failed to drop: {failed_count}")
+
+        return failed_count == 0
+
     def export_all_applications(self, export_path: str, passphrase: str = None) -> bool:
         """Export all applications to a zip file using EXPORT APPLICATION ALL"""
         if not self.token:
@@ -415,6 +504,8 @@ def main():
                        help=f'Passphrase for export encryption (default: {default_config["passphrase"]})')
     parser.add_argument('--environment', choices=['default'] + list(config.ENVIRONMENTS.keys()),
                        default='default', help='Environment configuration to use')
+    parser.add_argument('--droptypes', nargs=2, metavar=('NAMESPACE', 'SOURCE_COMPONENT_NAME'),
+                       help='Drop all types matching the given namespace and source component name prefix (format: namespace.source_component_name_*)')
 
     args = parser.parse_args()
 
@@ -434,6 +525,9 @@ def main():
     print("🚀 Starting Striim Export All with Checkpoint Position Updater")
     print(f"   Striim URL: {args.url}")
     print(f"   Stage Directory: {args.stage_dir}")
+    if args.droptypes:
+        namespace, source_component_name = args.droptypes
+        print(f"   Drop Types Prefix: {namespace}.{source_component_name}_")
     print()
     
     # Initialize API client
@@ -444,7 +538,15 @@ def main():
     if not api.authenticate():
         sys.exit(1)
     print()
-    
+
+    # Optional: Drop types if requested
+    if args.droptypes:
+        namespace, source_component_name = args.droptypes
+        print(f"Step 1.5: Dropping types with prefix {namespace}.{source_component_name}_...")
+        if not api.drop_types_by_prefix(namespace, source_component_name):
+            print("⚠️  Some types failed to drop, but continuing with export...")
+        print()
+
     # Step 2: Get application list
     print("Step 2: Getting application list...")
     app_names = get_application_list(api)
