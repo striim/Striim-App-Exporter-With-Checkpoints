@@ -1,10 +1,26 @@
-# Drop Types Functionality
+# Enhanced Export Functionality
 
-The `--droptypes` flag has been added to the `striim_export_all_with_checkpoint.py` script to replicate the functionality of the bash script for dropping types based on a naming convention. It supports both **explicit** and **auto-detection** modes.
+The `striim_export_all_with_checkpoint.py` script has been enhanced with additional flags for comprehensive application management:
+
+- `--droptypes`: Drop types based on naming convention (explicit or auto-detection modes)
+- `--stopapps`: Stop and undeploy all applications before exporting
+
+These flags can be used independently or together for a complete workflow.
 
 ## Usage
 
-### Explicit Mode (Manual Specification)
+### Stop Applications Only
+```bash
+# Stop and undeploy all applications before exporting
+python3 striim_export_all_with_checkpoint.py --stopapps
+
+# Stop apps with environment-specific configuration
+python3 striim_export_all_with_checkpoint.py --stopapps --environment production
+```
+
+### Drop Types Only
+
+#### Explicit Mode (Manual Specification)
 ```bash
 # Drop types with prefix "admin.MySource_" before exporting
 python3 striim_export_all_with_checkpoint.py --droptypes admin MySource
@@ -16,7 +32,7 @@ python3 striim_export_all_with_checkpoint.py --droptypes admin MySource --stage-
 python3 striim_export_all_with_checkpoint.py --droptypes admin MySource --environment production
 ```
 
-### Auto-Detection Mode (Automatic)
+#### Auto-Detection Mode (Automatic)
 ```bash
 # Auto-detect source components from applications and drop their types
 python3 striim_export_all_with_checkpoint.py --droptypes
@@ -26,6 +42,18 @@ python3 striim_export_all_with_checkpoint.py --droptypes-auto
 
 # Auto-detect with environment configuration
 python3 striim_export_all_with_checkpoint.py --droptypes --environment production
+```
+
+### Combined Workflow (Recommended)
+```bash
+# Complete workflow: stop apps, auto-drop types, then export
+python3 striim_export_all_with_checkpoint.py --stopapps --droptypes
+
+# Complete workflow with explicit type dropping
+python3 striim_export_all_with_checkpoint.py --stopapps --droptypes admin MySource
+
+# Complete workflow for production environment
+python3 striim_export_all_with_checkpoint.py --stopapps --droptypes --environment production
 ```
 
 ## How it works
@@ -84,15 +112,32 @@ The script will:
    - `system.MonitorApp` → `system.MonitorApp_`
 3. Drop types for each prefix automatically
 
+## Stop Applications Functionality
+
+The `--stopapps` flag stops and undeploys all applications before exporting:
+
+### How it works
+1. **Application Discovery**: Gets the list of all applications from Striim
+2. **Stop Applications**: For each application, executes `STOP APPLICATION {app_name};`
+3. **Undeploy Applications**: For each application, executes `UNDEPLOY APPLICATION {app_name};`
+4. **Error Handling**: Continues processing even if individual stop/undeploy commands fail
+
+### Benefits
+- **Clean State**: Ensures all applications are in a stopped/undeployed state
+- **Consistent Export**: Applications are exported in a known state
+- **Migration Prep**: Prepares source environment for migration
+- **Resource Cleanup**: Frees up resources during export process
+
 ## Integration with Export Process
 
-The drop types functionality is integrated as an optional step in the export process:
+The enhanced export process with all flags:
 
 1. **Step 1**: Authenticate with Striim
-2. **Step 1.5** (if --droptypes specified): Drop matching types
-3. **Step 2**: Get application list
-4. **Step 3**: Export all applications
-5. **Step 4**: Process applications for checkpoint updates
+2. **Step 2**: Get application list
+3. **Step 2.3** (if --stopapps specified): Stop and undeploy all applications
+4. **Step 2.5** (if --droptypes specified): Drop matching types
+5. **Step 3**: Export all applications
+6. **Step 4**: Process applications for checkpoint updates
 
 ## Error Handling
 

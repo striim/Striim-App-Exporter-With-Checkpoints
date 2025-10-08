@@ -4,11 +4,12 @@ Striim Export All with Checkpoint Position Updater
 
 This script:
 1. Authenticates with Striim API
-2. Optionally drops types matching a namespace and source component name prefix
-3. Gets list of all applications using 'mon;'
-4. Exports all applications using EXPORT APPLICATION ALL with passphrase
-5. Gets checkpoint history for all applications
-6. Updates TQL files with checkpoint positions (only for Global.MysqlReader and Global.MSSqlReader sources)
+2. Gets list of all applications using 'mon;'
+3. Optionally stops and undeploys all applications
+4. Optionally drops types matching a namespace and source component name prefix
+5. Exports all applications using EXPORT APPLICATION ALL with passphrase
+6. Gets checkpoint history for all applications
+7. Updates TQL files with checkpoint positions (only for Global.MysqlReader and Global.MSSqlReader sources)
 
 Usage:
     python striim_export_all_with_checkpoint.py
@@ -17,6 +18,8 @@ Usage:
     python striim_export_all_with_checkpoint.py --droptypes admin MySource
     python striim_export_all_with_checkpoint.py --droptypes  # Auto-detect from apps
     python striim_export_all_with_checkpoint.py --droptypes-auto  # Alternative auto-detect
+    python striim_export_all_with_checkpoint.py --stopapps  # Stop and undeploy all apps
+    python striim_export_all_with_checkpoint.py --stopapps --droptypes  # Stop apps and auto-drop types
 """
 
 import requests
@@ -225,6 +228,81 @@ class StriimAPI:
                 print(f"⚠️  Failed to drop some types for {namespace}.{source_component}")
 
         return overall_success
+
+    def stop_application(self, app_name: str) -> bool:
+        """Stop an application"""
+        if not self.token:
+            print("✗ Not authenticated. Call authenticate() first.")
+            return False
+
+        command = f"STOP APPLICATION {app_name};"
+
+        try:
+            result = self.execute_command(command)
+            if result and len(result) > 0:
+                if result[0].get('executionStatus') == 'Success':
+                    return True
+                else:
+                    # It's okay if stop fails (app might not be running)
+                    return True
+            return True
+        except Exception as e:
+            print(f"    ⚠️  Stop failed: {e}")
+            return True  # Continue even if stop fails
+
+    def undeploy_application(self, app_name: str) -> bool:
+        """Undeploy an application"""
+        if not self.token:
+            print("✗ Not authenticated. Call authenticate() first.")
+            return False
+
+        command = f"UNDEPLOY APPLICATION {app_name};"
+
+        try:
+            result = self.execute_command(command)
+            if result and len(result) > 0:
+                if result[0].get('executionStatus') == 'Success':
+                    return True
+                else:
+                    # It's okay if undeploy fails (app might not be deployed)
+                    return True
+            return True
+        except Exception as e:
+            print(f"    ⚠️  Undeploy failed: {e}")
+            return True  # Continue even if undeploy fails
+
+    def stop_and_undeploy_all_applications(self, app_names: List[str]) -> bool:
+        """Stop and undeploy all applications"""
+        print(f"Stopping and undeploying {len(app_names)} applications...")
+
+        stopped_count = 0
+        undeployed_count = 0
+
+        for app_name in app_names:
+            print(f"\n  Processing {app_name}...")
+
+            # Stop the application
+            print(f"    - Stopping...")
+            if self.stop_application(app_name):
+                stopped_count += 1
+                print(f"    ✓ Stopped successfully")
+            else:
+                print(f"    ⚠️  Stop failed (continuing)")
+
+            # Undeploy the application
+            print(f"    - Undeploying...")
+            if self.undeploy_application(app_name):
+                undeployed_count += 1
+                print(f"    ✓ Undeployed successfully")
+            else:
+                print(f"    ⚠️  Undeploy failed (continuing)")
+
+        print(f"\nStop/Undeploy summary:")
+        print(f"  Total applications: {len(app_names)}")
+        print(f"  Successfully stopped: {stopped_count}")
+        print(f"  Successfully undeployed: {undeployed_count}")
+
+        return True  # Always return True since failures are non-fatal
 
     def export_all_applications(self, export_path: str, passphrase: str = None) -> bool:
         """Export all applications to a zip file using EXPORT APPLICATION ALL"""
@@ -466,9 +544,9 @@ def update_tql_with_position(tql_file_path: str, reader_type: str, position_info
         updated_content = content
 
         if reader_type == 'mysql':
-            # Replace StartTimestamp: 'NOW' with the position information
-            pattern = r"StartTimestamp:\s*'NOW'"
-            replacement = f"StartTimestamp: '{position_string}'"
+            # Replace StartPosition: 'NOW' with the position information
+            pattern = r"StartPosition:\s*'NOW'"
+            replacement = f"StartPosition: '{position_string}'"
             updated_content = re.sub(pattern, replacement, content)
 
         elif reader_type == 'sqlserver':
@@ -554,6 +632,8 @@ def main():
                        help='Drop types. Usage: --droptypes (auto-detect from apps with checkpoints) or --droptypes NAMESPACE SOURCE_COMPONENT_NAME (explicit)')
     parser.add_argument('--droptypes-auto', action='store_true',
                        help='Automatically drop types for all applications with checkpoint data (alternative to --droptypes with no args)')
+    parser.add_argument('--stopapps', action='store_true',
+                       help='Stop and undeploy all applications before exporting')
 
     args = parser.parse_args()
 
@@ -579,6 +659,8 @@ def main():
         elif args.droptypes and len(args.droptypes) == 2:
             namespace, source_component_name = args.droptypes
             print(f"   Drop Types Prefix: {namespace}.{source_component_name}_")
+    if args.stopapps:
+        print(f"   Stop Applications: Yes")
     print()
     
     # Initialize API client
@@ -590,13 +672,19 @@ def main():
         sys.exit(1)
     print()
 
-    # Step 2: Get application list (moved up to support auto-drop-types)
+    # Step 2: Get application list (moved up to support auto-drop-types and stop-apps)
     print("Step 2: Getting application list...")
     app_names = get_application_list(api)
     if not app_names:
         print("✗ No applications found. Exiting.")
         sys.exit(1)
     print()
+
+    # Optional: Stop and undeploy applications if requested
+    if args.stopapps:
+        print("Step 2.3: Stopping and undeploying applications...")
+        api.stop_and_undeploy_all_applications(app_names)
+        print()
 
     # Optional: Drop types if requested
     if args.droptypes is not None or args.droptypes_auto:
@@ -690,7 +778,7 @@ def main():
             print(f"    ✓ Updated TQL file with position: {position_info['format_string']}")
         else:
             if reader_type == 'mysql':
-                start_field = "StartTimestamp"
+                start_field = "StartPosition"
             elif reader_type == 'sqlserver':
                 start_field = "StartPosition"
             else:  # mongodb
