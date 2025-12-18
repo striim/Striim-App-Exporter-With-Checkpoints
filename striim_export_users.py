@@ -22,6 +22,10 @@ import os
 from typing import Dict, Optional, List
 from pathlib import Path
 import config
+import urllib3
+
+# Disable SSL warnings for self-signed certificates
+urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
 
 class StriimAPI:
@@ -41,7 +45,7 @@ class StriimAPI:
         headers = {'Content-Type': 'application/x-www-form-urlencoded'}
         
         try:
-            response = requests.post(auth_url, data=data, headers=headers)
+            response = requests.post(auth_url, data=data, headers=headers, verify=False)
             response.raise_for_status()
             
             result = response.json()
@@ -74,7 +78,7 @@ class StriimAPI:
         }
         
         try:
-            response = requests.post(api_url, headers=headers, data=command)
+            response = requests.post(api_url, headers=headers, data=command, verify=False)
             response.raise_for_status()
             
             result = response.json()
