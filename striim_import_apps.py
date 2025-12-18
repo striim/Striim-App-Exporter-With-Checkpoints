@@ -22,6 +22,10 @@ import os
 from typing import Dict, Optional, List
 from pathlib import Path
 import config
+import urllib3
+
+# Disable SSL warnings for self-signed certificates
+urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
 
 class StriimImportAPI:
@@ -44,7 +48,7 @@ class StriimImportAPI:
         data = f"username={self.username}&password={self.password}"
         
         try:
-            response = requests.post(url, headers=headers, data=data)
+            response = requests.post(url, headers=headers, data=data, verify=False)
             if response.status_code == 200:
                 result = response.json()
                 self.token = result.get('token')
@@ -70,7 +74,7 @@ class StriimImportAPI:
         }
         
         try:
-            response = requests.post(url, headers=headers, data=tql_content)
+            response = requests.post(url, headers=headers, data=tql_content, verify=False)
             if response.status_code == 200:
                 return response.json()
             else:
@@ -94,7 +98,7 @@ class StriimImportAPI:
         }
         
         try:
-            response = requests.post(url, headers=headers, data=command)
+            response = requests.post(url, headers=headers, data=command, verify=False)
             if response.status_code == 200:
                 result = response.json()
                 if result and len(result) > 0:
@@ -125,7 +129,7 @@ class StriimImportAPI:
         }
 
         try:
-            response = requests.post(url, headers=headers, data=command)
+            response = requests.post(url, headers=headers, data=command, verify=False)
             if response.status_code == 200:
                 result = response.json()
                 if result and len(result) > 0:
@@ -154,7 +158,7 @@ class StriimImportAPI:
         }
 
         try:
-            response = requests.post(url, headers=headers, data=command)
+            response = requests.post(url, headers=headers, data=command, verify=False)
             if response.status_code == 200:
                 result = response.json()
                 if result and len(result) > 0:
@@ -183,7 +187,7 @@ class StriimImportAPI:
         }
 
         try:
-            response = requests.post(url, headers=headers, data=command)
+            response = requests.post(url, headers=headers, data=command, verify=False)
             if response.status_code == 200:
                 result = response.json()
                 if result and len(result) > 0:
