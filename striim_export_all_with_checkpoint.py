@@ -9,7 +9,7 @@ This script:
 4. Optionally drops types matching a namespace and source component name prefix
 5. Exports all applications using EXPORT APPLICATION ALL with passphrase
 6. Gets checkpoint history for all applications
-7. Updates TQL files with checkpoint positions (only for Global.MysqlReader and Global.MSSqlReader sources)
+7. Updates TQL files with checkpoint positions (for Global.MysqlReader, Global.MSSqlReader, Global.MongoDBReader, Global.OracleReader, and Global.IncrementalBatchReader sources)
 
 Usage:
     python striim_export_all_with_checkpoint.py
@@ -33,6 +33,10 @@ import tempfile
 from typing import Dict, Optional, List, Tuple, List
 from pathlib import Path
 import config
+import urllib3
+
+# Disable SSL warnings for self-signed certificates
+urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
 
 class StriimAPI:
@@ -52,7 +56,7 @@ class StriimAPI:
         headers = {'Content-Type': 'application/x-www-form-urlencoded'}
         
         try:
-            response = requests.post(auth_url, data=data, headers=headers)
+            response = requests.post(auth_url, data=data, headers=headers, verify=False)
             response.raise_for_status()
             
             result = response.json()
@@ -85,7 +89,7 @@ class StriimAPI:
         }
         
         try:
-            response = requests.post(api_url, headers=headers, data=command)
+            response = requests.post(api_url, headers=headers, data=command, verify=False)
             response.raise_for_status()
             
             result = response.json()
@@ -362,7 +366,7 @@ class StriimAPI:
         command = f'EXPORT APPLICATION ALL passphrase="{passphrase}";'
 
         try:
-            response = requests.post(api_url, headers=headers, data=command)
+            response = requests.post(api_url, headers=headers, data=command, verify=False)
             response.raise_for_status()
 
             # The response should be the zip file content
@@ -565,6 +569,10 @@ def get_reader_type(tql_file_path: str) -> Optional[str]:
         if re.search(r'CREATE\s+(?:OR\s+REPLACE\s+)?SOURCE\s+\w+\s+USING\s+Global\.OJet', content, re.IGNORECASE):
             return 'oracle'  # Treat OJet the same as Oracle
 
+        # Look for CREATE SOURCE ... USING Global.IncrementalBatchReader pattern
+        if re.search(r'CREATE\s+(?:OR\s+REPLACE\s+)?SOURCE\s+\w+\s+USING\s+Global\.IncrementalBatchReader', content, re.IGNORECASE):
+            return 'incrementalbatch'
+
         return None
 
     except Exception as e:
@@ -590,6 +598,12 @@ def update_tql_with_position(tql_file_path: str, reader_type: str, position_info
 
         elif reader_type == 'sqlserver':
             # Replace StartPosition: 'NOW' with the LSN information
+            pattern = r"StartPosition:\s*'NOW'"
+            replacement = f"StartPosition: '{position_string}'"
+            updated_content = re.sub(pattern, replacement, content)
+
+        elif reader_type == 'incrementalbatch':
+            # Replace StartPosition: 'NOW' with the position information
             pattern = r"StartPosition:\s*'NOW'"
             replacement = f"StartPosition: '{position_string}'"
             updated_content = re.sub(pattern, replacement, content)
@@ -779,6 +793,7 @@ def main():
     sqlserver_reader_count = 0
     mongodb_reader_count = 0
     oracle_reader_count = 0
+    incrementalbatch_reader_count = 0
     checkpoint_data_count = 0
 
     for app_name, tql_file in exported_files.items():
@@ -787,7 +802,7 @@ def main():
         # Check what type of reader it uses
         reader_type = get_reader_type(tql_file)
         if not reader_type:
-            print(f"    ⏭️  Skipping - does not use Global.MysqlReader, Global.MSSqlReader, Global.MSJet, Global.MongoDBReader, Global.OracleReader, or Global.OJet")
+            print(f"    ⏭️  Skipping - does not use Global.MysqlReader, Global.MSSqlReader, Global.MSJet, Global.MongoDBReader, Global.OracleReader, Global.OJet, or Global.IncrementalBatchReader")
             continue
 
         if reader_type == 'mysql':
@@ -802,6 +817,9 @@ def main():
         elif reader_type == 'oracle':
             oracle_reader_count += 1
             print(f"    ✓ Uses Global.OracleReader")
+        elif reader_type == 'incrementalbatch':
+            incrementalbatch_reader_count += 1
+            print(f"    ✓ Uses Global.IncrementalBatchReader")
 
         # Get checkpoint history
         position_info = get_checkpoint_history(api, app_name)
@@ -821,8 +839,12 @@ def main():
                 start_field = "StartPosition"
             elif reader_type == 'sqlserver':
                 start_field = "StartPosition"
-            else:  # mongodb
+            elif reader_type == 'incrementalbatch':
+                start_field = "StartPosition"
+            elif reader_type == 'mongodb':
                 start_field = "startTimestamp"
+            else:  # oracle
+                start_field = "startSCN"
             print(f"    ⚠️  No {start_field}: 'NOW' found to update")
 
     print(f"\n🎉 Processing complete!")
@@ -832,6 +854,7 @@ def main():
     print(f"   Using Global.MSSqlReader: {sqlserver_reader_count}")
     print(f"   Using Global.MongoDBReader: {mongodb_reader_count}")
     print(f"   Using Global.OracleReader: {oracle_reader_count}")
+    print(f"   Using Global.IncrementalBatchReader: {incrementalbatch_reader_count}")
     print(f"   With checkpoint data: {checkpoint_data_count}")
     print(f"   Updated with positions: {updated_count}")
 
