@@ -582,18 +582,40 @@ def get_reader_type(tql_file_path: str) -> Optional[str]:
         return None
 
 
-def remove_existing_position_parameters(content: str) -> str:
+def remove_existing_position_parameters(content: str, debug: bool = False) -> str:
     """Remove existing StartPosition, StartSCN, and StartTimestamp parameters from TQL content"""
     updated_content = content
 
-    # Remove StartPosition with any value (handles both single and double quotes)
-    updated_content = re.sub(r',?\s*StartPosition\s*:\s*[\'"][^\'"]*[\'"]', '', updated_content, flags=re.IGNORECASE)
+    # Define all possible position parameter patterns (case variations and quoted/unquoted values)
+    position_patterns = [
+        # StartPosition variations (quoted values)
+        r',?\s*StartPosition\s*:\s*[\'"][^\'"]*[\'"]',
+        r',?\s*startPosition\s*:\s*[\'"][^\'"]*[\'"]',
+        # StartPosition variations (unquoted values - numbers, NOW, etc.)
+        r',?\s*StartPosition\s*:\s*[^,\)\s]+',
+        r',?\s*startPosition\s*:\s*[^,\)\s]+',
 
-    # Remove StartSCN with any value (handles both single and double quotes)
-    updated_content = re.sub(r',?\s*StartSCN\s*:\s*[\'"][^\'"]*[\'"]', '', updated_content, flags=re.IGNORECASE)
+        # StartSCN variations (quoted values)
+        r',?\s*StartSCN\s*:\s*[\'"][^\'"]*[\'"]',
+        r',?\s*startSCN\s*:\s*[\'"][^\'"]*[\'"]',
+        # StartSCN variations (unquoted values)
+        r',?\s*StartSCN\s*:\s*[^,\)\s]+',
+        r',?\s*startSCN\s*:\s*[^,\)\s]+',
 
-    # Remove StartTimestamp with any value (handles both single and double quotes)
-    updated_content = re.sub(r',?\s*StartTimestamp\s*:\s*[\'"][^\'"]*[\'"]', '', updated_content, flags=re.IGNORECASE)
+        # StartTimestamp variations (quoted values)
+        r',?\s*StartTimestamp\s*:\s*[\'"][^\'"]*[\'"]',
+        r',?\s*startTimestamp\s*:\s*[\'"][^\'"]*[\'"]',
+        # StartTimestamp variations (unquoted values)
+        r',?\s*StartTimestamp\s*:\s*[^,\)\s]+',
+        r',?\s*startTimestamp\s*:\s*[^,\)\s]+',
+    ]
+
+    # Apply each pattern to remove position parameters
+    for pattern in position_patterns:
+        matches = re.findall(pattern, updated_content, flags=re.IGNORECASE | re.MULTILINE)
+        if matches and debug:
+            print(f"    🔍 Found and removing: {matches}")
+        updated_content = re.sub(pattern, '', updated_content, flags=re.IGNORECASE | re.MULTILINE)
 
     # Clean up any double commas that might result from removals
     updated_content = re.sub(r',\s*,', ',', updated_content)
@@ -605,6 +627,36 @@ def remove_existing_position_parameters(content: str) -> str:
     updated_content = re.sub(r'\(\s*,', '(', updated_content)
 
     return updated_content
+
+
+def verify_single_position_parameter(content: str, expected_param: str) -> bool:
+    """Verify that only the expected position parameter exists in the content"""
+    # Check for all possible position parameters with more specific patterns
+    position_params_found = set()
+
+    # Look for StartPosition variations
+    if re.search(r'\bStartPosition\s*:', content, flags=re.IGNORECASE):
+        position_params_found.add('startposition')
+
+    # Look for StartSCN variations
+    if re.search(r'\bStartSCN\s*:', content, flags=re.IGNORECASE):
+        position_params_found.add('startscn')
+
+    # Look for StartTimestamp variations
+    if re.search(r'\bStartTimestamp\s*:', content, flags=re.IGNORECASE):
+        position_params_found.add('starttimestamp')
+
+    if len(position_params_found) == 0:
+        return False  # No position parameter found
+    elif len(position_params_found) == 1:
+        # Check if the found parameter matches the expected one (case insensitive)
+        found_param = list(position_params_found)[0]
+        expected_normalized = expected_param.lower()
+        return found_param == expected_normalized
+    else:
+        # Multiple position parameters found - this is the problem we're trying to fix
+        print(f"    ⚠️  Multiple position parameters found: {list(position_params_found)}")
+        return False
 
 
 def add_position_parameter_to_source(content: str, reader_type: str, position_string: str) -> str:
@@ -661,11 +713,30 @@ def update_tql_with_position(tql_file_path: str, reader_type: str, position_info
 
         position_string = position_info['format_string']
 
+        # Determine expected parameter name based on reader type
+        if reader_type in ['mysql', 'sqlserver', 'incrementalbatch']:
+            expected_param = 'StartPosition'
+        elif reader_type == 'mongodb':
+            expected_param = 'startTimestamp'
+        elif reader_type == 'oracle':
+            expected_param = 'startSCN'
+        else:
+            print(f"    ⚠️  Unknown reader type: {reader_type}")
+            return False
+
         # Step 1: Remove any existing position parameters
-        updated_content = remove_existing_position_parameters(content)
+        updated_content = remove_existing_position_parameters(content, debug=False)
 
         # Step 2: Add the appropriate position parameter with checkpoint value
         updated_content = add_position_parameter_to_source(updated_content, reader_type, position_string)
+
+        # Step 3: Verify that only one position parameter exists
+        if not verify_single_position_parameter(updated_content, expected_param):
+            print(f"    ⚠️  Verification failed - multiple position parameters detected")
+            # Enable debug mode to show what was found
+            print(f"    🔍 Re-running with debug to identify the issue...")
+            remove_existing_position_parameters(content, debug=True)
+            return False
 
         # Check if any changes were made
         if updated_content == content:
