@@ -10,6 +10,8 @@ This script:
 5. Exports all applications using EXPORT APPLICATION ALL with passphrase
 6. Gets checkpoint history for all applications
 7. Updates TQL files with checkpoint positions (for Global.MysqlReader, Global.MSSqlReader, Global.MongoDBReader, Global.OracleReader, and Global.IncrementalBatchReader sources)
+   - Removes any existing StartPosition, StartSCN, or StartTimestamp parameters from the source
+   - Replaces them with the appropriate checkpoint position value
 
 Usage:
     python striim_export_all_with_checkpoint.py
@@ -580,6 +582,76 @@ def get_reader_type(tql_file_path: str) -> Optional[str]:
         return None
 
 
+def remove_existing_position_parameters(content: str) -> str:
+    """Remove existing StartPosition, StartSCN, and StartTimestamp parameters from TQL content"""
+    updated_content = content
+
+    # Remove StartPosition with any value (handles both single and double quotes)
+    updated_content = re.sub(r',?\s*StartPosition\s*:\s*[\'"][^\'"]*[\'"]', '', updated_content, flags=re.IGNORECASE)
+
+    # Remove StartSCN with any value (handles both single and double quotes)
+    updated_content = re.sub(r',?\s*StartSCN\s*:\s*[\'"][^\'"]*[\'"]', '', updated_content, flags=re.IGNORECASE)
+
+    # Remove StartTimestamp with any value (handles both single and double quotes)
+    updated_content = re.sub(r',?\s*StartTimestamp\s*:\s*[\'"][^\'"]*[\'"]', '', updated_content, flags=re.IGNORECASE)
+
+    # Clean up any double commas that might result from removals
+    updated_content = re.sub(r',\s*,', ',', updated_content)
+
+    # Clean up comma followed by closing parenthesis
+    updated_content = re.sub(r',\s*\)', ')', updated_content)
+
+    # Clean up opening parenthesis followed by comma
+    updated_content = re.sub(r'\(\s*,', '(', updated_content)
+
+    return updated_content
+
+
+def add_position_parameter_to_source(content: str, reader_type: str, position_string: str) -> str:
+    """Add the appropriate position parameter to the source definition"""
+    updated_content = content
+
+    if reader_type in ['mysql', 'sqlserver', 'incrementalbatch']:
+        parameter_name = 'StartPosition'
+    elif reader_type == 'mongodb':
+        parameter_name = 'startTimestamp'
+    elif reader_type == 'oracle':
+        parameter_name = 'startSCN'
+    else:
+        return content  # Unknown reader type
+
+    # Find the appropriate source definition based on reader type
+    if reader_type == 'mysql':
+        source_pattern = r'(CREATE\s+(?:OR\s+REPLACE\s+)?SOURCE\s+\w+\s+USING\s+Global\.MysqlReader\s*\([^)]*?)(\s*\)\s*OUTPUT)'
+    elif reader_type == 'sqlserver':
+        source_pattern = r'(CREATE\s+(?:OR\s+REPLACE\s+)?SOURCE\s+\w+\s+USING\s+Global\.(?:MSSqlReader|MSJet)\s*\([^)]*?)(\s*\)\s*OUTPUT)'
+    elif reader_type == 'incrementalbatch':
+        source_pattern = r'(CREATE\s+(?:OR\s+REPLACE\s+)?SOURCE\s+\w+\s+USING\s+Global\.IncrementalBatchReader\s*\([^)]*?)(\s*\)\s*OUTPUT)'
+    elif reader_type == 'mongodb':
+        source_pattern = r'(CREATE\s+(?:OR\s+REPLACE\s+)?SOURCE\s+\w+\s+USING\s+Global\.MongoDBReader\s*\([^)]*?)(\s*\)\s*OUTPUT)'
+    elif reader_type == 'oracle':
+        source_pattern = r'(CREATE\s+(?:OR\s+REPLACE\s+)?SOURCE\s+\w+\s+USING\s+Global\.(?:OracleReader|OJet)\s*\([^)]*?)(\s*\)\s*OUTPUT)'
+    else:
+        return content
+
+    match = re.search(source_pattern, content, re.IGNORECASE | re.DOTALL)
+    if match:
+        before_closing = match.group(1)
+        after_closing = match.group(2)
+
+        # Check if there are already parameters (look for content after the opening parenthesis)
+        if re.search(r'\(\s*$', before_closing):
+            # No existing parameters, add without comma
+            replacement = f"{before_closing}\n  {parameter_name}: '{position_string}'{after_closing}"
+        else:
+            # Existing parameters, add with comma
+            replacement = f"{before_closing},\n  {parameter_name}: '{position_string}'{after_closing}"
+
+        updated_content = re.sub(source_pattern, replacement, content, flags=re.IGNORECASE | re.DOTALL)
+
+    return updated_content
+
+
 def update_tql_with_position(tql_file_path: str, reader_type: str, position_info: Dict) -> bool:
     """Update TQL file with checkpoint position"""
     try:
@@ -588,67 +660,16 @@ def update_tql_with_position(tql_file_path: str, reader_type: str, position_info
             content = f.read()
 
         position_string = position_info['format_string']
-        updated_content = content
 
-        if reader_type == 'mysql':
-            # Replace StartPosition: 'NOW' with the position information
-            pattern = r"StartPosition:\s*'NOW'"
-            replacement = f"StartPosition: '{position_string}'"
-            updated_content = re.sub(pattern, replacement, content)
+        # Step 1: Remove any existing position parameters
+        updated_content = remove_existing_position_parameters(content)
 
-        elif reader_type == 'sqlserver':
-            # Replace StartPosition: 'NOW' with the LSN information
-            pattern = r"StartPosition:\s*'NOW'"
-            replacement = f"StartPosition: '{position_string}'"
-            updated_content = re.sub(pattern, replacement, content)
+        # Step 2: Add the appropriate position parameter with checkpoint value
+        updated_content = add_position_parameter_to_source(updated_content, reader_type, position_string)
 
-        elif reader_type == 'incrementalbatch':
-            # Replace StartPosition: 'NOW' with the position information
-            pattern = r"StartPosition:\s*'NOW'"
-            replacement = f"StartPosition: '{position_string}'"
-            updated_content = re.sub(pattern, replacement, content)
-
-        elif reader_type == 'mongodb':
-            # For MongoDB, check if startTimestamp already exists
-            pattern = r"startTimestamp:\s*'[^']*'"
-            if re.search(pattern, content):
-                # Replace existing startTimestamp
-                replacement = f"startTimestamp: '{position_string}'"
-                updated_content = re.sub(pattern, replacement, content)
-            else:
-                # Add startTimestamp field before the closing ) of the source definition
-                # Find the source definition and add the field
-                source_pattern = r'(CREATE\s+SOURCE\s+\w+\s+USING\s+Global\.MongoDBReader\s*\([^)]+)(\s*\)\s*OUTPUT)'
-                match = re.search(source_pattern, content, re.IGNORECASE | re.DOTALL)
-                if match:
-                    before_closing = match.group(1)
-                    after_closing = match.group(2)
-                    # Add startTimestamp before the closing parenthesis
-                    replacement = f"{before_closing}, \n  startTimestamp: '{position_string}'{after_closing}"
-                    updated_content = re.sub(source_pattern, replacement, content, flags=re.IGNORECASE | re.DOTALL)
-
-        elif reader_type == 'oracle':
-            # For Oracle and OJet, check if startSCN already exists
-            pattern = r"startSCN:\s*'[^']*'"
-            if re.search(pattern, content):
-                # Replace existing startSCN
-                replacement = f"startSCN: '{position_string}'"
-                updated_content = re.sub(pattern, replacement, content)
-            else:
-                # Add startSCN field before the closing ) of the source definition
-                # Find the source definition and add the field (handles both OracleReader and OJet)
-                source_pattern = r'(CREATE\s+(?:OR\s+REPLACE\s+)?SOURCE\s+\w+\s+USING\s+Global\.(?:OracleReader|OJet)\s*\([^)]+)(\s*\)\s*OUTPUT)'
-                match = re.search(source_pattern, content, re.IGNORECASE | re.DOTALL)
-                if match:
-                    before_closing = match.group(1)
-                    after_closing = match.group(2)
-                    # Add startSCN before the closing parenthesis
-                    replacement = f"{before_closing}, \n  startSCN: '{position_string}'{after_closing}"
-                    updated_content = re.sub(source_pattern, replacement, content, flags=re.IGNORECASE | re.DOTALL)
-
-        # Check if replacement was made
+        # Check if any changes were made
         if updated_content == content:
-            return False  # No replacement made
+            return False  # No changes made
 
         # Write the updated content back to the same file
         with open(tql_file_path, 'w') as f:
@@ -835,17 +856,7 @@ def main():
             updated_count += 1
             print(f"    ✓ Updated TQL file with position: {position_info['format_string']}")
         else:
-            if reader_type == 'mysql':
-                start_field = "StartPosition"
-            elif reader_type == 'sqlserver':
-                start_field = "StartPosition"
-            elif reader_type == 'incrementalbatch':
-                start_field = "StartPosition"
-            elif reader_type == 'mongodb':
-                start_field = "startTimestamp"
-            else:  # oracle
-                start_field = "startSCN"
-            print(f"    ⚠️  No {start_field}: 'NOW' found to update")
+            print(f"    ⚠️  Failed to update TQL file with checkpoint position")
 
     print(f"\n🎉 Processing complete!")
     print(f"   Total applications: {len(app_names)}")
