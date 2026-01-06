@@ -7,11 +7,13 @@ This script:
 2. Gets list of all users using 'list users;'
 3. Describes each user to get their roles
 4. Generates CREATE USER statements (excluding system users: admin, sys)
-5. Writes statements to users/users.tql
+5. Optionally exports custom roles with --include-roles flag
+6. Writes statements to users/users.tql
 
 Usage:
     python striim_export_users.py
     python striim_export_users.py --environment production
+    python striim_export_users.py --include-roles
 """
 
 import requests
@@ -92,8 +94,11 @@ class StriimAPI:
             return None
 
 
-def export_users(api: StriimAPI) -> bool:
-    """Get list of all users from 'list users;' command, describe each user, and write CREATE USER statements to file"""
+def export_users(api: StriimAPI, include_roles: bool = False) -> bool:
+    """Get list of all users from 'list users;' command, describe each user, and write CREATE USER statements to file.
+
+    If include_roles is True, also exports custom roles at the end of the file.
+    """
     print("Getting list of users...")
 
     result = api.execute_command("list users;")
@@ -186,6 +191,31 @@ def export_users(api: StriimAPI) -> bool:
                 # Log error but don't add to file
                 print(f"    ⚠️  Error processing {username}: {e}")
 
+        # Export roles if requested (to separate file)
+        roles_tql_file = os.path.join(users_dir, "roles.tql")
+        has_roles = False
+        if include_roles:
+            print("\nExporting custom roles...")
+            role_statements = export_roles(api, usernames)
+            if role_statements is None:
+                print("⚠️  Warning: Failed to export roles, continuing with users only")
+                role_statements = ""
+
+            if role_statements:
+                try:
+                    with open(roles_tql_file, 'w') as f:
+                        f.write("-- Striim Custom Roles Export\n")
+                        f.write(f"-- Generated on: {Path(roles_tql_file).absolute()}\n")
+                        f.write("-- \n")
+                        f.write("-- Run this file BEFORE users.tql to create roles that users depend on\n")
+                        f.write("-- \n\n")
+                        f.write(role_statements)
+                        f.write('\n')
+                    has_roles = True
+                    print(f"✓ Successfully wrote custom roles to: {roles_tql_file}")
+                except Exception as e:
+                    print(f"⚠️  Warning: Failed to write roles.tql file: {e}")
+
         # Write CREATE USER statements to file
         users_tql_file = os.path.join(users_dir, "users.tql")
         try:
@@ -194,6 +224,13 @@ def export_users(api: StriimAPI) -> bool:
                 f.write(f"-- Generated on: {Path(users_tql_file).absolute()}\n")
                 f.write("-- \n")
                 f.write("-- Note: Replace 'password' with actual passwords before importing\n")
+
+                # Add reference to roles.tql if roles were exported
+                if has_roles:
+                    f.write("-- \n")
+                    f.write("-- IMPORTANT: Run roles.tql first to create custom roles before running this file\n")
+                    f.write("-- @include roles.tql\n")
+
                 f.write("-- \n\n")
                 f.write('\n'.join(create_statements))
                 f.write('\n')
@@ -209,10 +246,136 @@ def export_users(api: StriimAPI) -> bool:
         return False
 
 
+def get_usernames(api: StriimAPI) -> List[str]:
+    """Get list of all usernames from 'list users;' command"""
+    result = api.execute_command("list users;")
+    if not result:
+        return []
+
+    usernames = []
+    try:
+        if len(result) > 0 and 'output' in result[0]:
+            output = result[0]['output']
+            if isinstance(output, list):
+                for item in output:
+                    if isinstance(item, dict):
+                        for key, value in item.items():
+                            if key.startswith('user') and isinstance(value, str):
+                                usernames.append(value)
+    except Exception:
+        pass
+    return usernames
+
+
+def export_roles(api: StriimAPI, usernames: List[str]) -> Optional[str]:
+    """
+    Export custom roles, excluding:
+    - Global.* roles
+    - System$* roles
+    - User-specific roles (user.dev, user.enduser, user.admin, user.useradmin)
+
+    Returns the TQL statements as a string, or None on failure.
+    """
+    print("Getting list of roles...")
+
+    result = api.execute_command("list roles;")
+    if not result:
+        return None
+
+    try:
+        # Parse the list roles command output
+        role_names = []
+        if len(result) > 0 and 'output' in result[0]:
+            output = result[0]['output']
+            if isinstance(output, list):
+                for item in output:
+                    if isinstance(item, dict):
+                        for key, value in item.items():
+                            if key.startswith('role') and isinstance(value, str):
+                                role_names.append(value)
+
+        if not role_names:
+            print("✗ No roles found in list roles output")
+            return None
+
+        print(f"✓ Found {len(role_names)} total roles")
+
+        # Build set of user-specific role suffixes to exclude
+        user_role_suffixes = ['.dev', '.enduser', '.admin', '.useradmin']
+
+        # Filter out roles to exclude
+        roles_to_export = []
+        for role_name in role_names:
+            # Skip Global.* roles
+            if role_name.startswith('Global.'):
+                continue
+
+            # Skip System$* roles
+            if role_name.startswith('System$'):
+                continue
+
+            # Skip user-specific auto-created roles
+            is_user_role = False
+            for username in usernames:
+                for suffix in user_role_suffixes:
+                    if role_name == f"{username}{suffix}":
+                        is_user_role = True
+                        break
+                if is_user_role:
+                    break
+
+            if not is_user_role:
+                roles_to_export.append(role_name)
+
+        print(f"✓ {len(roles_to_export)} custom roles to export (after filtering)")
+
+        if not roles_to_export:
+            return ""
+
+        # Describe each role to get permissions
+        role_statements = []
+        for role_name in roles_to_export:
+            print(f"  Describing role: {role_name}")
+            describe_result = api.execute_command(f"describe role {role_name};")
+
+            if not describe_result or len(describe_result) == 0:
+                print(f"    ⚠️  Failed to retrieve details for {role_name}")
+                continue
+
+            try:
+                output = describe_result[0].get('output', [])
+                if len(output) > 0:
+                    role_info = output[0]
+                    permissions = role_info.get('permissions', [])
+
+                    # Generate CREATE ROLE statement
+                    role_statements.append(f"CREATE ROLE {role_name};")
+
+                    # Generate GRANT statements for each permission
+                    for permission in permissions:
+                        # Permission format: "GRANT UPDATE ON cluster Global.somepart"
+                        # Convert to: GRANT UPDATE ON cluster Global.somepart TO role_name;
+                        grant_stmt = f"{permission} TO {role_name};"
+                        role_statements.append(grant_stmt)
+
+                    role_statements.append("")  # Empty line between roles
+                    print(f"    ✓ Retrieved {len(permissions)} permissions for {role_name}")
+            except Exception as e:
+                print(f"    ⚠️  Error processing {role_name}: {e}")
+
+        return '\n'.join(role_statements)
+
+    except Exception as e:
+        print(f"✗ Error processing role list: {e}")
+        return None
+
+
 def main():
     parser = argparse.ArgumentParser(description='Export Striim users to TQL file')
     parser.add_argument('--environment', type=str, default='default',
                        help='Environment name from config.py (default: "default")')
+    parser.add_argument('--include-roles', action='store_true',
+                       help='Also export custom roles (excluding Global.*, System$*, and user-specific roles)')
 
     args = parser.parse_args()
 
@@ -220,7 +383,10 @@ def main():
     env_config = config.get_config(args.environment)
 
     print("🚀 Starting Striim User Export")
-    print(f"   Striim URL: {env_config['url']}\n")
+    print(f"   Striim URL: {env_config['url']}")
+    if args.include_roles:
+        print("   Include Roles: Yes")
+    print()
 
     # Step 1: Authenticate
     print("Step 1: Authenticating with Striim...")
@@ -235,9 +401,10 @@ def main():
         sys.exit(1)
     print()
 
-    # Step 2: Export users
-    print("Step 2: Exporting users...")
-    success = export_users(api)
+    # Step 2: Export users (and optionally roles)
+    step_desc = "Exporting users and roles..." if args.include_roles else "Exporting users..."
+    print(f"Step 2: {step_desc}")
+    success = export_users(api, include_roles=args.include_roles)
     if not success:
         print("✗ Failed to export users")
         sys.exit(1)

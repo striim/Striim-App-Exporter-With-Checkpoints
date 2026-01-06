@@ -23,6 +23,7 @@ This tool automatically exports all Striim applications using bulk export, retri
 
 - `striim_export_all_with_checkpoint.py` - Export and checkpoint update script
 - `striim_import_apps.py` - Import applications script
+- `striim_export_users.py` - Export users and custom roles script
 - `config.py` - Configuration file with environment settings
 - `README.md` - This documentation
 
@@ -285,3 +286,37 @@ STRIIM_CONFIG_IMPORT = {
 - **Force Mode**: Required when applications already exist on target server
 - **Passphrase**: Must match the passphrase used during export (if applicable)
 - **Deploy Order**: Applications are imported/deployed in alphabetical order
+
+---
+
+# Striim User Exporter
+
+## Overview
+
+The `striim_export_users.py` script exports Striim users and optionally custom roles to TQL files.
+
+## Usage
+
+```bash
+# Export users only
+python3 striim_export_users.py
+
+# Export users and custom roles
+python3 striim_export_users.py --include-roles
+
+# Use specific environment
+python3 striim_export_users.py --environment production --include-roles
+```
+
+## Output
+
+- `users/users.tql` - CREATE USER statements
+- `users/roles.tql` - CREATE ROLE and GRANT statements (when using `--include-roles`)
+
+## Notes
+
+- System users (`admin`, `sys`) are excluded
+- Auto-created user roles (`user.dev`, `user.admin`, `user.enduser`, `user.useradmin`) are excluded
+- `Global.*` and `System$*` roles are excluded
+- Run `roles.tql` before `users.tql` to ensure roles exist before user creation
+- Replace `password` placeholder with actual passwords before importing
