@@ -76,7 +76,8 @@ class UpgradeState:
             'removed_components': {},
             'unloaded_components': [],
             'loaded_components': [],
-            'restored_apps': []
+            'restored_apps': [],
+            'library_files': {}  # Map base_name -> filename (e.g., AdvFormat -> AdvFormat-5.0.2.jar)
         }
 
     def save(self):
@@ -244,19 +245,24 @@ class StriimUpgradeManager:
         # Get list of custom libraries from Striim
         print("\nGetting list of custom libraries...")
         libraries_result = self.api.execute_command("LIST LIBRARIES;")
+        custom_libraries = set()  # For backward compatibility (base names)
+        library_files = {}  # Map base_name -> full filename
+
         if not libraries_result:
             print("[WARN] Failed to get libraries list")
-            custom_libraries = set()
         else:
-            custom_libraries = set()
             if isinstance(libraries_result, list) and len(libraries_result) > 0:
                 output = libraries_result[0].get('output', [])
                 for item in output:
                     if 'fileName' in item:
                         filename = item['fileName']
+                        # Extract base name (e.g., AdvFormat from AdvFormat-5.0.2.jar)
                         base_name = filename.split('-')[0].split('.')[0]
                         custom_libraries.add(base_name)
-            print(f"[OK] Found {len(custom_libraries)} custom libraries: {custom_libraries}")
+                        library_files[base_name] = filename
+            print(f"[OK] Found {len(custom_libraries)} custom libraries:")
+            for base_name, filename in sorted(library_files.items()):
+                print(f"     - {base_name}: {filename}")
 
         # Get application states from Striim
         print("\nGetting application states...")
@@ -303,9 +309,10 @@ class StriimUpgradeManager:
                     udfs=comp.get('udfs')  # Pass UDFs for CQ components
                 )
 
-        # Save application states and deployment plans
+        # Save application states, deployment plans, and library files
         self.state.state['app_states'] = app_states
         self.state.state['deployment_plans'] = deployment_plans
+        self.state.state['library_files'] = library_files
 
         self.state.set_phase('analyzed')
 
@@ -403,22 +410,24 @@ class StriimUpgradeManager:
         # Get list of custom libraries
         print("\nGetting list of custom libraries...")
         libraries_result = self.api.execute_command("LIST LIBRARIES;")
+        custom_libraries = set()  # For backward compatibility (base names)
+        library_files = {}  # Map base_name -> full filename
+
         if not libraries_result:
             print("[WARN] Failed to get libraries list")
-            custom_libraries = set()
         else:
-            # Extract library names from the response
-            custom_libraries = set()
             if isinstance(libraries_result, list) and len(libraries_result) > 0:
                 output = libraries_result[0].get('output', [])
                 for item in output:
                     if 'fileName' in item:
-                        # Extract base name without version and extension
-                        # e.g., "StriimWatcher-5.2.0.4.jar" -> "StriimWatcher"
                         filename = item['fileName']
+                        # Extract base name (e.g., AdvFormat from AdvFormat-5.0.2.jar)
                         base_name = filename.split('-')[0].split('.')[0]
                         custom_libraries.add(base_name)
-            print(f"[OK] Found {len(custom_libraries)} custom libraries: {custom_libraries}")
+                        library_files[base_name] = filename
+            print(f"[OK] Found {len(custom_libraries)} custom libraries:")
+            for base_name, filename in sorted(library_files.items()):
+                print(f"     - {base_name}: {filename}")
 
         # Export all to analyze TQL
         print("\nExporting applications to analyze...")
@@ -453,9 +462,10 @@ class StriimUpgradeManager:
                     simple_name=comp.get('simple_name')
                 )
 
-        # Save application states and deployment plans
+        # Save application states, deployment plans, and library files
         self.state.state['app_states'] = app_states
         self.state.state['deployment_plans'] = deployment_plans
+        self.state.state['library_files'] = library_files
 
         self.state.set_phase('analyzed')
 
@@ -964,9 +974,13 @@ class StriimUpgradeManager:
     def unload_components(self):
         """Unload OPs/UDFs from Striim
 
-        This unloads the LIBRARIES (JAR files), not individual component instances.
-        For OPs: UNLOAD OPEN PROCESSOR '<library_name>';
-        For UDFs: UNLOAD UDF '<package_name>';
+        This unloads the LIBRARIES (JAR files) from LIST LIBRARIES.
+        For OPs: UNLOAD OPEN PROCESSOR 'UploadedFiles/<filename>';
+        For UDFs: UNLOAD 'UploadedFiles/<filename>';
+
+        Example:
+            UNLOAD OPEN PROCESSOR 'UploadedFiles/EventChanger-5.0.2.jar';
+            UNLOAD 'UploadedFiles/AdvFormat-5.0.2.jar';
         """
         print("\n=== Unloading Components from Striim ===")
 
@@ -974,71 +988,90 @@ class StriimUpgradeManager:
             print("[WARN] No removed components found. Run --remove-from-apps first.")
             return
 
-        # Get unique libraries to unload
-        libraries_to_unload = set()  # For Open Processors
-        udf_packages_to_unload = set()  # For UDFs
+        # Get library files from state
+        library_files = self.state.state.get('library_files', {})
+        if not library_files:
+            print("[ERROR] No library files found in state. Run --analyze first.")
+            return
+
+        # Determine which libraries are actually used by components
+        libraries_in_use = set()  # Base names of libraries that are used
 
         for app_name, components in self.state.state['apps_with_components'].items():
             for comp in components:
                 comp_type = comp['type']
 
                 if comp_type == 'OP':
-                    # For OPs, we need the library name from custom_libraries
-                    # The library name is stored in the component data
+                    # For OPs, extract the library base name from the component
+                    # This would need to be stored during analysis
                     library_name = comp.get('library_name')
                     if library_name:
-                        libraries_to_unload.add(library_name)
-                    else:
-                        print(f"[WARN] No library_name found for OP {comp['name']}, skipping")
+                        libraries_in_use.add(library_name)
 
                 elif comp_type == 'CQ':
-                    # For CQs with UDFs, extract the package name (e.g., com.striim.util.AdvFormat)
+                    # For CQs with UDFs, extract the base name from the UDF package
+                    # e.g., com.striim.util.AdvFormat.LowercaseTableName -> AdvFormat
                     udfs = comp.get('udfs', [])
                     for udf_full_name in udfs:
-                        # Extract package name (everything except the last part)
-                        # e.g., com.striim.util.AdvFormat.LowercaseTableName -> com.striim.util.AdvFormat
-                        parts = udf_full_name.rsplit('.', 1)
-                        if len(parts) > 1:
-                            package_name = parts[0]
-                            udf_packages_to_unload.add(package_name)
+                        # Try to match UDF package to library base name
+                        # e.g., com.striim.util.AdvFormat -> AdvFormat
+                        parts = udf_full_name.split('.')
+                        if len(parts) >= 2:
+                            # Try the last part before the method name
+                            # e.g., AdvFormat from com.striim.util.AdvFormat.LowercaseTableName
+                            potential_base = parts[-2]
+                            if potential_base in library_files:
+                                libraries_in_use.add(potential_base)
 
-        # Unload Open Processor libraries
-        for library_name in sorted(libraries_to_unload):
-            if self.dry_run:
-                print(f"  [DRY-RUN] Would unload OPEN PROCESSOR '{library_name}'")
+        if not libraries_in_use:
+            print("[WARN] No libraries identified for unloading")
+            return
+
+        print(f"\n[INFO] Libraries to unload ({len(libraries_in_use)}):")
+        for base_name in sorted(libraries_in_use):
+            filename = library_files.get(base_name, f"{base_name}.jar")
+            print(f"  - {base_name}: {filename}")
+
+        # Unload each library
+        # Note: We need to determine if it's an OP or UDF library
+        # For now, we'll try UNLOAD (for UDFs) first, then UNLOAD OPEN PROCESSOR if that fails
+        for base_name in sorted(libraries_in_use):
+            filename = library_files.get(base_name)
+            if not filename:
+                print(f"[WARN] No filename found for library '{base_name}', skipping")
                 continue
 
-            print(f"  Unloading OPEN PROCESSOR '{library_name}'...")
-            unload_cmd = f"UNLOAD OPEN PROCESSOR '{library_name}';"
-            result = self.api.execute_command(unload_cmd)
+            file_path = f"UploadedFiles/{filename}"
 
-            if result:
-                self.state.state['unloaded_components'].append(f"OP:{library_name}")
-                print(f"  [OK] Unloaded {library_name}")
-            else:
-                print(f"  [WARN] Failed to unload {library_name}")
-
-        # Unload UDF packages
-        for package_name in sorted(udf_packages_to_unload):
             if self.dry_run:
-                print(f"  [DRY-RUN] Would unload UDF '{package_name}'")
+                print(f"  [DRY-RUN] Would unload '{file_path}'")
                 continue
 
-            print(f"  Unloading UDF '{package_name}'...")
-            unload_cmd = f"UNLOAD UDF '{package_name}';"
+            # Try UNLOAD first (for UDFs)
+            print(f"  Unloading '{file_path}'...")
+            unload_cmd = f"UNLOAD '{file_path}';"
             result = self.api.execute_command(unload_cmd)
 
-            if result:
-                self.state.state['unloaded_components'].append(f"UDF:{package_name}")
-                print(f"  [OK] Unloaded {package_name}")
+            if result and not (isinstance(result, list) and len(result) > 0 and result[0].get('failureMessage')):
+                self.state.state['unloaded_components'].append(file_path)
+                print(f"  [OK] Unloaded {filename}")
             else:
-                print(f"  [WARN] Failed to unload {package_name}")
+                # Try UNLOAD OPEN PROCESSOR (for OPs)
+                print(f"  Trying as Open Processor...")
+                unload_cmd = f"UNLOAD OPEN PROCESSOR '{file_path}';"
+                result = self.api.execute_command(unload_cmd)
+
+                if result and not (isinstance(result, list) and len(result) > 0 and result[0].get('failureMessage')):
+                    self.state.state['unloaded_components'].append(file_path)
+                    print(f"  [OK] Unloaded {filename}")
+                else:
+                    error_msg = result[0].get('failureMessage', 'Unknown error') if isinstance(result, list) and len(result) > 0 else 'Unknown error'
+                    print(f"  [ERROR] Failed to unload {filename}: {error_msg}")
 
         if not self.dry_run:
             self.state.set_phase('components_unloaded')
 
-        total_unloaded = len(libraries_to_unload) + len(udf_packages_to_unload)
-        print(f"\n[OK] Unloaded {len(libraries_to_unload)} OP library(ies) and {len(udf_packages_to_unload)} UDF package(s) (total: {total_unloaded})")
+        print(f"\n[OK] Unload process complete. Attempted to unload {len(libraries_in_use)} library(ies)")
 
     def load_components(self, component_path: str = None):
         """Load new OPs/UDFs after upgrade"""
