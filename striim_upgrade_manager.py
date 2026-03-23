@@ -663,12 +663,19 @@ class StriimUpgradeManager:
                     if udf_name not in existing_cq['udfs']:
                         existing_cq['udfs'].append(udf_name)
                 else:
+                    # Find CQ position in TQL to determine which flow it's in
+                    cq_pattern = rf'CREATE\s+(?:OR\s+REPLACE\s+)?CQ\s+(?:\w+\.)?{re.escape(cq_name.split(".")[-1])}'
+                    cq_match = re.search(cq_pattern, tql_content, re.IGNORECASE)
+                    cq_position = cq_match.start() if cq_match else 0
+                    flow_name = self._find_flow_for_component(tql_content, cq_position)
+
                     # Create new CQ entry
                     components[app_name].append({
                         'type': 'CQ',
                         'name': cq_name,
                         'simple_name': cq_name.split('.')[-1],  # For DROP command
                         'component_type': 'CQ',
+                        'flow': flow_name,  # Add flow information
                         'udfs': [udf_name],
                         'create_statement': cq_statement
                     })
@@ -903,12 +910,13 @@ class StriimUpgradeManager:
                     print(f"  Stopping {app_name}...")
                     self.api.execute_command(f"STOP APPLICATION {app_name};")
 
-            # Undeploy app (whether it was RUNNING or DEPLOYED)
-            if app_state in ['RUNNING', 'DEPLOYED']:
+            # Undeploy app (whether it was RUNNING, DEPLOYED, HALTED, or TERMINATED)
+            # HALTED and TERMINATED apps must also be undeployed before components can be removed
+            if app_state in ['RUNNING', 'DEPLOYED', 'HALTED', 'TERMINATED']:
                 if self.dry_run:
-                    print(f"  [DRY-RUN] Would undeploy {app_name}")
+                    print(f"  [DRY-RUN] Would undeploy {app_name} (currently {app_state})")
                 else:
-                    print(f"  Undeploying {app_name}...")
+                    print(f"  Undeploying {app_name} (currently {app_state})...")
                     self.api.execute_command(f"UNDEPLOY APPLICATION {app_name};")
 
             for comp in components:
@@ -1280,6 +1288,11 @@ class StriimUpgradeManager:
                 apps_to_deploy.append(app_name)
             elif original_state == 'RUNNING':
                 apps_to_start.append(app_name)
+            elif original_state in ['HALTED', 'TERMINATED']:
+                # HALTED/TERMINATED apps should be restored to DEPLOYED state
+                # (they were undeployed during component removal)
+                apps_to_deploy.append(app_name)
+                print(f"[INFO] {app_name} was {original_state}, will restore to DEPLOYED")
             elif original_state == 'CREATED':
                 # Already in correct state, no action needed
                 pass
