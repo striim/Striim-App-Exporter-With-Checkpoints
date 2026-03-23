@@ -29,6 +29,7 @@ Usage:
     python striim_upgrade_manager.py --remove-from-apps
     python striim_upgrade_manager.py --unload-components
     python striim_upgrade_manager.py --load-components
+    python striim_upgrade_manager.py --load-components --component-path "file1.jar,file2.jar,file3.jar"
     python striim_upgrade_manager.py --restore-to-apps
     python striim_upgrade_manager.py --restore-app-states
 
@@ -1036,25 +1037,59 @@ class StriimUpgradeManager:
         print(f"\n[OK] Unload complete: {unloaded_count} succeeded, {failed_count} failed (total: {len(library_files)})")
 
     def load_components(self, component_path: str = None):
-        """Load new OPs/UDFs after upgrade"""
+        """Load new OPs/UDFs after upgrade
+
+        Can load multiple files from UploadedFiles/ directory.
+        For each file, tries LOAD first (for UDFs), then LOAD OPEN PROCESSOR (for OPs).
+        """
         print("\n=== Loading Components ===")
 
         if component_path:
-            # Load specific component (manual mode)
-            if self.dry_run:
-                print(f"  [DRY-RUN] Would load {component_path}")
-                return
+            # Manual mode - load specific file(s)
+            # Support comma-separated list of files
+            files_to_load = [f.strip() for f in component_path.split(',')]
 
-            print(f"  Loading {component_path}...")
-            load_cmd = f"LOAD OPEN PROCESSOR '{component_path}';"
-            result = self.api.execute_command(load_cmd)
+            print(f"\n[INFO] Loading {len(files_to_load)} file(s)...")
+            loaded_count = 0
+            failed_count = 0
 
-            if result:
-                self.state.state['loaded_components'].append(component_path)
+            for file_path in files_to_load:
+                # Ensure path starts with UploadedFiles/
+                if not file_path.startswith('UploadedFiles/'):
+                    file_path = f"UploadedFiles/{file_path}"
+
+                if self.dry_run:
+                    print(f"\n  [DRY-RUN] Would load {file_path}")
+                    continue
+
+                print(f"\n  Loading '{file_path}'...")
+
+                # Try LOAD first (for UDFs)
+                load_cmd = f"LOAD '{file_path}';"
+                result = self.api.execute_command(load_cmd)
+
+                if result and not (isinstance(result, list) and len(result) > 0 and result[0].get('failureMessage')):
+                    self.state.state['loaded_components'].append(file_path)
+                    print(f"    [OK] Loaded {file_path} (UDF)")
+                    loaded_count += 1
+                else:
+                    # Try LOAD OPEN PROCESSOR (for OPs)
+                    print(f"    Trying as Open Processor...")
+                    load_cmd = f"LOAD OPEN PROCESSOR '{file_path}';"
+                    result = self.api.execute_command(load_cmd)
+
+                    if result and not (isinstance(result, list) and len(result) > 0 and result[0].get('failureMessage')):
+                        self.state.state['loaded_components'].append(file_path)
+                        print(f"    [OK] Loaded {file_path} (OP)")
+                        loaded_count += 1
+                    else:
+                        error_msg = result[0].get('failureMessage', 'Unknown error') if isinstance(result, list) and len(result) > 0 else 'Unknown error'
+                        print(f"    [ERROR] Failed to load {file_path}: {error_msg}")
+                        failed_count += 1
+
+            if not self.dry_run:
                 self.state.save()
-                print(f"  [OK] Loaded {component_path}")
-            else:
-                print(f"  [ERROR] Failed to load {component_path}")
+                print(f"\n[OK] Load complete: {loaded_count} succeeded, {failed_count} failed (total: {len(files_to_load)})")
         else:
             # Interactive mode - map old components to new versions
             self._interactive_component_loading()
@@ -1158,19 +1193,37 @@ class StriimUpgradeManager:
                 print("\n[DRY-RUN] Would load the above components")
             else:
                 print("\n[INFO] Loading components...")
+                loaded_count = 0
+                failed_count = 0
+
                 for old_comp, new_path in component_mapping.items():
                     print(f"\nLoading {new_path}...")
-                    load_cmd = f"LOAD OPEN PROCESSOR '{new_path}';"
+
+                    # Try LOAD first (for UDFs)
+                    load_cmd = f"LOAD '{new_path}';"
                     result = self.api.execute_command(load_cmd)
 
-                    if result:
+                    if result and not (isinstance(result, list) and len(result) > 0 and result[0].get('failureMessage')):
                         self.state.state['loaded_components'].append(new_path)
-                        print(f"  [OK] Loaded {new_path}")
+                        print(f"  [OK] Loaded {new_path} (UDF)")
+                        loaded_count += 1
                     else:
-                        print(f"  [ERROR] Failed to load {new_path}")
+                        # Try LOAD OPEN PROCESSOR (for OPs)
+                        print(f"  Trying as Open Processor...")
+                        load_cmd = f"LOAD OPEN PROCESSOR '{new_path}';"
+                        result = self.api.execute_command(load_cmd)
+
+                        if result and not (isinstance(result, list) and len(result) > 0 and result[0].get('failureMessage')):
+                            self.state.state['loaded_components'].append(new_path)
+                            print(f"  [OK] Loaded {new_path} (OP)")
+                            loaded_count += 1
+                        else:
+                            error_msg = result[0].get('failureMessage', 'Unknown error') if isinstance(result, list) and len(result) > 0 else 'Unknown error'
+                            print(f"  [ERROR] Failed to load {new_path}: {error_msg}")
+                            failed_count += 1
 
                 self.state.save()
-                print("\n[OK] Component loading complete")
+                print(f"\n[OK] Component loading complete: {loaded_count} succeeded, {failed_count} failed")
         else:
             print("[WARN] No components were mapped")
 
