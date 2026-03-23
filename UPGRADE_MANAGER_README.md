@@ -60,7 +60,11 @@ python3 striim_upgrade_manager.py --restore-to-apps
 
 1. **Analyze** - Scans all applications to find OPs/UDFs and captures application states (RUNNING/DEPLOYED/CREATED)
    ```bash
+   # Full analysis (exports and analyzes)
    python3 striim_upgrade_manager.py --analyze
+
+   # Re-analyze from existing exported files (no re-export)
+   python3 striim_upgrade_manager.py --analyze-from-files
    ```
 
    Quick check without full analysis:
@@ -125,7 +129,8 @@ At this point, upgrade your Striim platform to the new version.
 
 | Flag | Description |
 |------|-------------|
-| `--analyze` | Scan all apps for OPs/UDFs and capture application states |
+| `--analyze` | Scan all apps for OPs/UDFs and capture application states (exports and analyzes) |
+| `--analyze-from-files` | Re-analyze from existing exported files (no re-export) |
 | `--remove-from-apps` | Remove components from apps (ALTER, DROP, RECOMPILE) |
 | `--unload-components` | Unload components from Striim |
 | `--load-components` | Load new components (requires `--component-path`) |

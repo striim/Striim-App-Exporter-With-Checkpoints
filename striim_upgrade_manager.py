@@ -203,6 +203,91 @@ class StriimUpgradeManager:
         self.state = state
         self.dry_run = dry_run
 
+    def analyze_from_files(self) -> Dict:
+        """Analyze existing exported TQL files without re-exporting"""
+        print("\n=== Analyzing from Existing Files ===")
+
+        # Check if backup directory and export file exist
+        export_path = os.path.join(BACKUP_DIR, "all_applications.zip")
+        if not os.path.exists(export_path):
+            print(f"[ERROR] Export file not found: {export_path}")
+            print("[INFO] Run --analyze first to export applications")
+            return {}
+
+        print(f"[OK] Found existing export: {export_path}")
+
+        # Get list of custom libraries from Striim
+        print("\nGetting list of custom libraries...")
+        libraries_result = self.api.execute_command("LIST LIBRARIES;")
+        if not libraries_result:
+            print("[WARN] Failed to get libraries list")
+            custom_libraries = set()
+        else:
+            custom_libraries = set()
+            if isinstance(libraries_result, list) and len(libraries_result) > 0:
+                output = libraries_result[0].get('output', [])
+                for item in output:
+                    if 'fileName' in item:
+                        filename = item['fileName']
+                        base_name = filename.split('-')[0].split('.')[0]
+                        custom_libraries.add(base_name)
+            print(f"[OK] Found {len(custom_libraries)} custom libraries: {custom_libraries}")
+
+        # Get application states from Striim
+        print("\nGetting application states...")
+        result = self.api.execute_command("mon;")
+        app_states = {}
+        if result and isinstance(result, list) and len(result) > 0:
+            output = result[0].get('output', {})
+            apps = output.get('striimApplications', [])
+            for app in apps:
+                app_name = app.get('fullName', '')
+                app_status = app.get('statusChange', 'UNKNOWN')
+                if app_name:
+                    app_states[app_name] = app_status
+        print(f"[OK] Retrieved {len(app_states)} application(s)")
+
+        # Analyze the existing export file
+        print("\nAnalyzing TQL files from export...")
+        passphrase = config.get_config().get('passphrase', 'striim123')
+        components_found = self._analyze_zip_for_components(export_path, passphrase, custom_libraries)
+
+        # Clear existing component data before saving new analysis
+        self.state.state['apps_with_components'] = {}
+
+        # Save to state
+        for app_name, components in components_found.items():
+            for comp in components:
+                parts = app_name.split('.', 1)
+                namespace = parts[0] if len(parts) > 1 else 'admin'
+                app = parts[1] if len(parts) > 1 else parts[0]
+                self.state.add_app_component(
+                    namespace, app, comp['type'], comp['name'], comp['create_statement'],
+                    drop_type=comp.get('component_type', 'SOURCE')
+                )
+
+        # Save application states
+        self.state.state['app_states'] = app_states
+
+        self.state.set_phase('analyzed')
+
+        # Display summary
+        print(f"\n[OK] Analysis complete. Found components in {len(components_found)} applications")
+        for app_name, comps in components_found.items():
+            print(f"  {app_name}: {len(comps)} component(s)")
+            for comp in comps:
+                print(f"    - {comp['type']}: {comp['name']}")
+
+        # Display application states
+        print(f"\n[INFO] Application States:")
+        for app_name, status in sorted(app_states.items()):
+            marker = " *" if app_name in components_found else ""
+            print(f"  {app_name}: {status}{marker}")
+        if components_found:
+            print("\n  * = Contains custom components")
+
+        return components_found
+
     def analyze(self) -> Dict:
         """Analyze all applications to find OPs and UDFs"""
         if self.dry_run:
@@ -1043,8 +1128,11 @@ def main():
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Examples:
-  # Analyze what needs to be done
+  # Analyze what needs to be done (exports and analyzes)
   python striim_upgrade_manager.py --analyze
+
+  # Re-analyze from existing exported files (no re-export)
+  python striim_upgrade_manager.py --analyze-from-files
 
   # Quick check: view app states without full analysis
   python striim_upgrade_manager.py --dry-run --analyze
@@ -1072,7 +1160,9 @@ Examples:
 
     # Actions
     parser.add_argument('--analyze', action='store_true',
-                       help='Analyze apps for OPs/UDFs')
+                       help='Analyze apps for OPs/UDFs (exports and analyzes)')
+    parser.add_argument('--analyze-from-files', action='store_true',
+                       help='Re-analyze from existing exported files (no re-export)')
     parser.add_argument('--remove-from-apps', action='store_true',
                        help='Remove OPs/UDFs from apps (ALTER, DROP, RECOMPILE)')
     parser.add_argument('--unload-components', action='store_true',
@@ -1132,6 +1222,8 @@ Examples:
     try:
         if args.analyze:
             manager.analyze()
+        elif args.analyze_from_files:
+            manager.analyze_from_files()
         elif args.remove_from_apps:
             manager.remove_from_apps()
         elif args.unload_components:
