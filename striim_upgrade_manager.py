@@ -578,12 +578,23 @@ class StriimUpgradeManager:
         for app_name, components in self.state.state['apps_with_components'].items():
             print(f"\nProcessing {app_name}...")
 
-            # Undeploy app first
-            if self.dry_run:
-                print(f"  [DRY-RUN] Would undeploy {app_name}")
-            else:
-                print(f"  Undeploying {app_name}...")
-                self.api.execute_command(f"UNDEPLOY APPLICATION {app_name};")
+            # Check app state - if RUNNING, need to STOP first, then UNDEPLOY
+            app_state = self.state.state.get('app_states', {}).get(app_name, 'UNKNOWN')
+
+            if app_state == 'RUNNING':
+                if self.dry_run:
+                    print(f"  [DRY-RUN] Would stop {app_name} (currently RUNNING)")
+                else:
+                    print(f"  Stopping {app_name}...")
+                    self.api.execute_command(f"STOP APPLICATION {app_name};")
+
+            # Undeploy app (whether it was RUNNING or DEPLOYED)
+            if app_state in ['RUNNING', 'DEPLOYED']:
+                if self.dry_run:
+                    print(f"  [DRY-RUN] Would undeploy {app_name}")
+                else:
+                    print(f"  Undeploying {app_name}...")
+                    self.api.execute_command(f"UNDEPLOY APPLICATION {app_name};")
 
             for comp in components:
                 comp_name = comp['name']
@@ -846,29 +857,71 @@ class StriimUpgradeManager:
         for app_name, components in self.state.state['apps_with_components'].items():
             print(f"\nProcessing {app_name}...")
 
+            # Check if app is deployed/running - if so, need to undeploy first
+            app_state = self.state.state.get('app_states', {}).get(app_name, 'UNKNOWN')
+
+            if app_state in ['RUNNING', 'DEPLOYED']:
+                if self.dry_run:
+                    print(f"  [DRY-RUN] Would undeploy {app_name} (currently {app_state})")
+                else:
+                    # Stop if running
+                    if app_state == 'RUNNING':
+                        print(f"  Stopping {app_name}...")
+                        self.api.execute_command(f"STOP APPLICATION {app_name};")
+
+                    # Undeploy
+                    print(f"  Undeploying {app_name}...")
+                    self.api.execute_command(f"UNDEPLOY APPLICATION {app_name};")
+
             for comp in components:
                 comp_name = comp['name']
                 comp_type = comp['type']
                 create_stmt = comp['create_statement']
                 component_type = comp['component_type']  # SOURCE or OPEN PROCESSOR
+                simple_name = comp.get('simple_name', comp_name)  # Use simple name for DROP
 
                 if self.dry_run:
                     print(f"  [DRY-RUN] Would restore {comp_type} {comp_name}")
                     continue
 
-                # Send ALTER, DROP (if exists), CREATE, RECOMPILE as a single batch command
+                # Restore component in steps
                 print(f"  Restoring {comp_type} {comp_name}...")
 
-                # Try to drop first in case it exists in a ghost state
-                drop_cmd = f"DROP {component_type} {comp_name};"
-                batch_cmd = f"ALTER APPLICATION {app_name};\n{drop_cmd}\n{create_stmt}\nALTER APPLICATION {app_name} RECOMPILE;"
-                result = self.api.execute_command(batch_cmd)
+                # Step 1: ALTER APPLICATION
+                alter_cmd = f"ALTER APPLICATION {app_name};"
+                self.api.execute_command(alter_cmd)
+
+                # Step 2: Try to DROP first (in case it exists in a ghost state)
+                # Use simple name for DROP (without namespace)
+                drop_cmd = f"DROP {component_type} {simple_name};"
+                self.api.execute_command(drop_cmd)  # Ignore errors if it doesn't exist
+
+                # Step 3: CREATE the component (use CREATE OR REPLACE if possible)
+                # Replace CREATE with CREATE OR REPLACE to handle existing components
+                if create_stmt.strip().upper().startswith('CREATE SOURCE'):
+                    create_stmt_safe = create_stmt.replace('CREATE SOURCE', 'CREATE OR REPLACE SOURCE', 1)
+                elif create_stmt.strip().upper().startswith('CREATE OPEN PROCESSOR'):
+                    create_stmt_safe = create_stmt.replace('CREATE OPEN PROCESSOR', 'CREATE OR REPLACE OPEN PROCESSOR', 1)
+                elif create_stmt.strip().upper().startswith('CREATE CQ'):
+                    create_stmt_safe = create_stmt.replace('CREATE CQ', 'CREATE OR REPLACE CQ', 1)
+                else:
+                    create_stmt_safe = create_stmt
+
+                result = self.api.execute_command(create_stmt_safe)
+
+                # Step 4: RECOMPILE
+                recompile_cmd = f"ALTER APPLICATION {app_name} RECOMPILE;"
+                self.api.execute_command(recompile_cmd)
 
                 if result:
                     self.state.state['restored_apps'].append(app_name)
                     print(f"  [OK] Restored {comp_name}")
                 else:
                     print(f"  [ERROR] Failed to restore {comp_name}")
+                    # Print more debug info
+                    if result and isinstance(result, list) and len(result) > 0:
+                        failure_msg = result[0].get('failureMessage', 'Unknown error')
+                        print(f"  [ERROR] Details: {failure_msg}")
 
         if not self.dry_run:
             self.state.set_phase('components_restored')
