@@ -220,14 +220,26 @@ class StriimUpgradeManager:
         """Analyze existing exported TQL files without re-exporting"""
         print("\n=== Analyzing from Existing Files ===")
 
-        # Check if backup directory and export file exist
+        # Check for extracted directory first, then fall back to zip
+        extracted_dir = os.path.join(BACKUP_DIR, "all_applications")
         export_path = os.path.join(BACKUP_DIR, "all_applications.zip")
-        if not os.path.exists(export_path):
-            print(f"[ERROR] Export file not found: {export_path}")
-            print("[INFO] Run --analyze first to export applications")
-            return {}
 
-        print(f"[OK] Found existing export: {export_path}")
+        use_directory = False
+        if os.path.isdir(extracted_dir):
+            # Count TQL files in directory
+            tql_files = [f for f in os.listdir(extracted_dir) if f.endswith('.tql')]
+            if tql_files:
+                print(f"[OK] Found extracted directory with {len(tql_files)} TQL files: {extracted_dir}")
+                use_directory = True
+            else:
+                print(f"[WARN] Directory exists but contains no TQL files: {extracted_dir}")
+
+        if not use_directory:
+            if not os.path.exists(export_path):
+                print(f"[ERROR] Export file not found: {export_path}")
+                print("[INFO] Run --analyze first to export applications")
+                return {}
+            print(f"[OK] Found existing export: {export_path}")
 
         # Get list of custom libraries from Striim
         print("\nGetting list of custom libraries...")
@@ -265,10 +277,14 @@ class StriimUpgradeManager:
         deployment_plans = self._get_deployment_plans(app_states)
         print(f"[OK] Retrieved {len(deployment_plans)} deployment plan(s)")
 
-        # Analyze the existing export file
-        print("\nAnalyzing TQL files from export...")
+        # Analyze the existing export file or directory
+        print("\nAnalyzing TQL files...")
         passphrase = config.get_config().get('passphrase', 'striim123')
-        components_found = self._analyze_zip_for_components(export_path, passphrase, custom_libraries)
+
+        if use_directory:
+            components_found = self._analyze_directory_for_components(extracted_dir, custom_libraries)
+        else:
+            components_found = self._analyze_zip_for_components(export_path, passphrase, custom_libraries)
 
         # Clear existing component data before saving new analysis
         self.state.state['apps_with_components'] = {}
@@ -461,6 +477,44 @@ class StriimUpgradeManager:
 
         return components_found
 
+    def _analyze_directory_for_components(self, directory_path: str, custom_libraries: set) -> Dict:
+        """Analyze TQL files from an extracted directory"""
+        components = {}
+
+        try:
+            # Get all TQL files from directory
+            tql_files = [f for f in os.listdir(directory_path) if f.endswith('.tql')]
+
+            if not tql_files:
+                print("[WARN] No TQL files found in directory")
+                return {}
+
+            print(f"[OK] Found {len(tql_files)} TQL files in directory")
+
+            # Analyze each TQL file
+            for i, tql_file in enumerate(tql_files, 1):
+                if i % 50 == 0:
+                    print(f"  Processed {i}/{len(tql_files)} files...")
+
+                file_path = os.path.join(directory_path, tql_file)
+                with open(file_path, 'r', encoding='utf-8') as f:
+                    tql_content = f.read()
+                    file_components = self._analyze_tql_for_components(tql_content, custom_libraries)
+
+                    # Merge components from this file
+                    for app_name, comps in file_components.items():
+                        if app_name not in components:
+                            components[app_name] = []
+                        components[app_name].extend(comps)
+
+            return components
+
+        except Exception as e:
+            print(f"[ERROR] Failed to analyze directory: {e}")
+            import traceback
+            traceback.print_exc()
+            return {}
+
     def _analyze_zip_for_components(self, zip_path: str, passphrase: str, custom_libraries: set) -> Dict:
         """Extract TQL files from zip and analyze for components"""
         components = {}
@@ -569,29 +623,19 @@ class StriimUpgradeManager:
         # Find all UDF calls within CQ statements
         # UDFs are Java functions called within CQs, not created with CREATE FUNCTION
         # Pattern: com.package.class.method(...) - must have at least 3 parts
+        # We track ALL UDFs that match this pattern, regardless of custom libraries list
         udf_calls_found = set()
         for match in re.finditer(udf_call_pattern, tql_content, re.IGNORECASE):
             udf_full_name = match.group(1)
 
-            # Only track custom UDFs (check against custom libraries)
             # Extract the package/class prefix (e.g., "com.striim.util" from "com.striim.util.AdvFormat")
+            # Must have at least 3 parts (package.class.method) to distinguish from Striim built-ins
             parts = udf_full_name.split('.')
             if len(parts) < 3:
                 continue
 
-            # Check if any custom library matches the UDF package
-            is_custom = False
-            for lib in custom_libraries:
-                # Fuzzy match: check if library name appears in UDF package
-                lib_lower = lib.lower()
-                udf_lower = udf_full_name.lower()
-                if lib_lower in udf_lower or any(lib_lower in part for part in parts):
-                    is_custom = True
-                    break
-
-            if not is_custom:
-                continue
-
+            # Track all UDFs that match the pattern
+            # Note: We don't filter by custom_libraries because that list may be incomplete
             udf_calls_found.add(udf_full_name)
 
         # For each UDF call found, determine which CQ(s) and app(s) it belongs to
@@ -767,7 +811,8 @@ class StriimUpgradeManager:
         Returns: List of (app_name, cq_name, cq_statement) tuples
         """
         # Pattern to find CQ statements
-        cq_pattern = r'CREATE\s+(?:OR\s+REPLACE\s+)?CQ\s+(?:(\w+)\.)?(\w+)\s+(.*?);;'
+        # Match CQ body up to single semicolon (not double)
+        cq_pattern = r'CREATE\s+(?:OR\s+REPLACE\s+)?CQ\s+(?:(\w+)\.)?(\w+)\s+(.*?);'
 
         cqs_found = []
         for match in re.finditer(cq_pattern, tql, re.IGNORECASE | re.DOTALL):
