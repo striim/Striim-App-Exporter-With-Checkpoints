@@ -1151,8 +1151,6 @@ class StriimUpgradeManager:
                 comp_name = comp['name']
                 comp_type = comp['type']
                 create_stmt = comp['create_statement']
-                component_type = comp['component_type']  # SOURCE or OPEN PROCESSOR
-                simple_name = comp.get('simple_name', comp_name)  # Use simple name for DROP
                 flow_name = comp.get('flow')  # Flow name if inside a FLOW block
 
                 if self.dry_run:
@@ -1160,34 +1158,10 @@ class StriimUpgradeManager:
                     print(f"  [DRY-RUN] Would restore {comp_type} {comp_name}{flow_info}")
                     continue
 
-                # Restore component in steps
+                # Restore component as a single batch command
                 flow_info = f" to FLOW {flow_name}" if flow_name else ""
                 print(f"  Restoring {comp_type} {comp_name}{flow_info}...")
 
-                # Step 1: ALTER APPLICATION
-                alter_cmd = f"ALTER APPLICATION {app_name};"
-                print(f"    [CMD] {alter_cmd}")
-                result1 = self.api.execute_command(alter_cmd)
-                if result1 and isinstance(result1, list) and len(result1) > 0 and result1[0].get('failureMessage'):
-                    print(f"    [ERROR] {result1[0]['failureMessage']}")
-
-                # Step 2: If in a FLOW, ALTER FLOW
-                if flow_name:
-                    alter_flow_cmd = f"ALTER FLOW {flow_name};"
-                    print(f"    [CMD] {alter_flow_cmd}")
-                    result2 = self.api.execute_command(alter_flow_cmd)
-                    if result2 and isinstance(result2, list) and len(result2) > 0 and result2[0].get('failureMessage'):
-                        print(f"    [ERROR] {result2[0]['failureMessage']}")
-
-                # Step 3: Try to DROP first (in case it exists in a ghost state)
-                # Use simple name for DROP (without namespace)
-                drop_cmd = f"DROP {component_type} {simple_name};"
-                print(f"    [CMD] {drop_cmd}")
-                result3 = self.api.execute_command(drop_cmd)  # Ignore errors if it doesn't exist
-                if result3 and isinstance(result3, list) and len(result3) > 0 and result3[0].get('failureMessage'):
-                    print(f"    [WARN] {result3[0]['failureMessage']} (expected if component doesn't exist)")
-
-                # Step 4: CREATE the component (use CREATE OR REPLACE if possible)
                 # Replace CREATE with CREATE OR REPLACE to handle existing components
                 if create_stmt.strip().upper().startswith('CREATE SOURCE'):
                     create_stmt_safe = create_stmt.replace('CREATE SOURCE', 'CREATE OR REPLACE SOURCE', 1)
@@ -1198,31 +1172,26 @@ class StriimUpgradeManager:
                 else:
                     create_stmt_safe = create_stmt
 
-                print(f"    [CMD] {create_stmt_safe}")
-                result = self.api.execute_command(create_stmt_safe)
+                # Build single batch command: ALTER APPLICATION; [ALTER FLOW;] CREATE OR REPLACE; [END FLOW;] RECOMPILE;
+                if flow_name:
+                    batch_cmd = f"ALTER APPLICATION {app_name};\nALTER FLOW {flow_name};\n{create_stmt_safe}\nEND FLOW {flow_name};\nALTER APPLICATION {app_name} RECOMPILE;"
+                else:
+                    batch_cmd = f"ALTER APPLICATION {app_name};\n{create_stmt_safe}\nALTER APPLICATION {app_name} RECOMPILE;"
+
+                # Print the batch command for debugging
+                print(f"    [CMD] Executing batch command:")
+                for line in batch_cmd.split('\n'):
+                    print(f"          {line}")
+
+                # Execute as single batch
+                result = self.api.execute_command(batch_cmd)
+
                 if result and isinstance(result, list) and len(result) > 0 and result[0].get('failureMessage'):
                     print(f"    [ERROR] {result[0]['failureMessage']}")
-
-                # Step 5: If in a FLOW, END FLOW
-                if flow_name:
-                    end_flow_cmd = f"END FLOW {flow_name};"
-                    print(f"    [CMD] {end_flow_cmd}")
-                    result5 = self.api.execute_command(end_flow_cmd)
-                    if result5 and isinstance(result5, list) and len(result5) > 0 and result5[0].get('failureMessage'):
-                        print(f"    [ERROR] {result5[0]['failureMessage']}")
-
-                # Step 6: RECOMPILE
-                recompile_cmd = f"ALTER APPLICATION {app_name} RECOMPILE;"
-                print(f"    [CMD] {recompile_cmd}")
-                result6 = self.api.execute_command(recompile_cmd)
-                if result6 and isinstance(result6, list) and len(result6) > 0 and result6[0].get('failureMessage'):
-                    print(f"    [ERROR] {result6[0]['failureMessage']}")
-
-                if result and not (isinstance(result, list) and len(result) > 0 and result[0].get('failureMessage')):
+                    print(f"  [ERROR] Failed to restore {comp_name}")
+                else:
                     self.state.state['restored_apps'].append(app_name)
                     print(f"  [OK] Restored {comp_name}")
-                else:
-                    print(f"  [ERROR] Failed to restore {comp_name}")
 
         if not self.dry_run:
             self.state.set_phase('components_restored')
