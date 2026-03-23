@@ -10,8 +10,9 @@ When upgrading Striim from one version to another, custom components (OPs and UD
 3. Recompiled for the new version
 4. Loaded back into the platform
 5. Restored to applications
+6. Applications redeployed to their original deployment groups and states
 
-This tool automates this entire workflow and maintains state across the upgrade process.
+This tool automates this entire workflow and maintains state across the upgrade process, including tracking deployment groups and strategies (ON_ONE vs ON_ALL).
 
 ## Components
 
@@ -114,14 +115,19 @@ At this point, upgrade your Striim platform to the new version.
    python3 striim_upgrade_manager.py --restore-to-apps
    ```
 
-7. **Restore App States** - Returns applications to their original states:
+7. **Restore App States** - Returns applications to their original states and deployment groups:
    ```sql
-   DEPLOY APPLICATION <name>;  -- For apps that were DEPLOYED
+   DEPLOY APPLICATION <name> ON {ONE|ALL} IN <deployment_group>;  -- For apps that were DEPLOYED
    START APPLICATION <name>;   -- For apps that were RUNNING
    ```
    ```bash
    python3 striim_upgrade_manager.py --restore-app-states
    ```
+
+   The tool automatically restores:
+   - **Deployment strategy**: `ON_ONE` (single server) or `ON_ALL` (all servers in group)
+   - **Deployment group**: The specific deployment group the app was running in
+   - **Application state**: DEPLOYED or RUNNING
 
 ## Command Reference
 
@@ -135,7 +141,7 @@ At this point, upgrade your Striim platform to the new version.
 | `--unload-components` | Unload components from Striim |
 | `--load-components` | Load new components (requires `--component-path`) |
 | `--restore-to-apps` | Restore components to apps (ALTER, CREATE, RECOMPILE) |
-| `--restore-app-states` | Restore applications to their original states (DEPLOYED/RUNNING) |
+| `--restore-app-states` | Restore applications to their original states and deployment groups |
 | `--prepare-for-upgrade` | Run all pre-upgrade steps (analyze, remove, unload) |
 | `--complete-upgrade` | Show post-upgrade instructions |
 | `--status` | Display current upgrade state |
@@ -211,12 +217,113 @@ The tool maintains state in `upgrade_state.json` to track:
 - Which applications have OPs/UDFs (including CQs with custom UDFs)
 - Original CREATE statements for each component
 - Application states (RUNNING/DEPLOYED/CREATED)
+- **Deployment plans** (deployment group and strategy: ON_ONE/ON_ALL)
 - Which components have been removed
 - Which components have been unloaded
 - Which components have been loaded
 - Which apps have been restored
 
-This allows the upgrade process to be interrupted and resumed.
+This allows the upgrade process to be interrupted and resumed, and ensures applications are restored to their exact original deployment configuration.
+
+## Deployment Groups and Strategies
+
+The tool automatically tracks and restores deployment configurations, including **multi-flow applications** where different flows run on different deployment groups (e.g., Forwarding Agents).
+
+### Deployment Strategies
+
+- **ON_ONE**: Application/flow runs on a single server in the deployment group (Striim picks the least loaded)
+- **ON_ALL**: Application/flow runs on all servers in the deployment group
+
+### Deployment Groups
+
+Deployment groups control which servers/agents run specific applications or flows. Common groups:
+- **default**: The default deployment group containing all servers
+- **Custom groups**: User-defined groups for specific servers or Forwarding Agents
+
+### Multi-Flow Applications
+
+Striim applications can contain multiple flows, each deployed to different deployment groups. This is common when using Forwarding Agents:
+
+```sql
+CREATE APPLICATION MyApp;
+
+CREATE FLOW AgentFlow;
+  -- Source reading local files on agent
+  CREATE SOURCE ... USING FileReader ...
+END FLOW AgentFlow;
+
+CREATE FLOW ServerFlow;
+  -- Target writing to database on server
+  CREATE TARGET ... USING DatabaseWriter ...
+END FLOW ServerFlow;
+
+END APPLICATION MyApp;
+
+-- Deploy with different groups per flow
+DEPLOY APPLICATION MyApp ON ONE IN default
+WITH AgentFlow ON ALL IN agent_group,
+     ServerFlow ON ONE IN default;
+```
+
+### How It Works
+
+1. **During Analysis**: The tool runs `DESCRIBE APPLICATION` for each deployed/running app to capture:
+   - Application-level deployment strategy and group
+   - Per-flow deployment strategies and groups (for multi-flow apps)
+
+2. **During Restore**: The tool reconstructs the exact deployment command:
+   ```sql
+   -- Single-flow app
+   DEPLOY APPLICATION admin.SimpleApp ON ONE IN default;
+
+   -- Multi-flow app
+   DEPLOY APPLICATION admin.MultiFlowApp ON ONE IN default
+   WITH AgentFlow ON ALL IN agent_group,
+        ServerFlow ON ONE IN default;
+   ```
+
+3. **Example State**:
+
+   **Single-flow application:**
+   ```json
+   {
+     "deployment_plans": {
+       "admin.SimpleApp": {
+         "application": {
+           "strategy": "ON_ONE",
+           "deploymentGroup": "default"
+         },
+         "flows": {}
+       }
+     }
+   }
+   ```
+
+   **Multi-flow application:**
+   ```json
+   {
+     "deployment_plans": {
+       "admin.MultiFlowApp": {
+         "application": {
+           "strategy": "ON_ONE",
+           "deploymentGroup": "default"
+         },
+         "flows": {
+           "AgentFlow": {
+             "strategy": "ON_ALL",
+             "deploymentGroup": "agent_group"
+           },
+           "ServerFlow": {
+             "strategy": "ON_ONE",
+             "deploymentGroup": "default"
+           }
+         }
+       }
+     }
+   }
+   ```
+
+This ensures that after upgrade, applications return to the exact same servers/agents they were running on before, with each flow deployed to its correct deployment group.
 
 ## Troubleshooting
 

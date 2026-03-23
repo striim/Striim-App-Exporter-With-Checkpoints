@@ -90,7 +90,7 @@ class UpgradeState:
         self.save()
 
     def add_app_component(self, namespace: str, app_name: str, component_type: str,
-                         component_name: str, create_statement: str, drop_type: str = None):
+                         component_name: str, create_statement: str, drop_type: str = None, flow: str = None):
         full_app_name = f"{namespace}.{app_name}"
         if full_app_name not in self.state['apps_with_components']:
             self.state['apps_with_components'][full_app_name] = []
@@ -101,7 +101,8 @@ class UpgradeState:
             'create_statement': create_statement,
             'namespace': namespace,
             'app_name': app_name,
-            'component_type': drop_type or 'SOURCE'  # For DROP command (SOURCE or OPEN PROCESSOR)
+            'component_type': drop_type or 'SOURCE',  # For DROP command (SOURCE or OPEN PROCESSOR)
+            'flow': flow  # Flow name if inside a FLOW block, None otherwise
         })
 
 
@@ -247,6 +248,11 @@ class StriimUpgradeManager:
                     app_states[app_name] = app_status
         print(f"[OK] Retrieved {len(app_states)} application(s)")
 
+        # Get deployment plans for deployed/running apps
+        print("\nGetting deployment plans...")
+        deployment_plans = self._get_deployment_plans(app_states)
+        print(f"[OK] Retrieved {len(deployment_plans)} deployment plan(s)")
+
         # Analyze the existing export file
         print("\nAnalyzing TQL files from export...")
         passphrase = config.get_config().get('passphrase', 'striim123')
@@ -263,11 +269,13 @@ class StriimUpgradeManager:
                 app = parts[1] if len(parts) > 1 else parts[0]
                 self.state.add_app_component(
                     namespace, app, comp['type'], comp['name'], comp['create_statement'],
-                    drop_type=comp.get('component_type', 'SOURCE')
+                    drop_type=comp.get('component_type', 'SOURCE'),
+                    flow=comp.get('flow')
                 )
 
-        # Save application states
+        # Save application states and deployment plans
         self.state.state['app_states'] = app_states
+        self.state.state['deployment_plans'] = deployment_plans
 
         self.state.set_phase('analyzed')
 
@@ -346,11 +354,19 @@ class StriimUpgradeManager:
 
         print(f"[OK] Retrieved {len(app_states)} application(s)")
 
+        # Get deployment plans for deployed/running apps
+        print("\nGetting deployment plans...")
+        deployment_plans = self._get_deployment_plans(app_states)
+        print(f"[OK] Retrieved {len(deployment_plans)} deployment plan(s)")
+
         # In dry-run mode, show states and exit early
         if self.dry_run:
             print(f"\n[INFO] Application States:")
             for app_name, status in sorted(app_states.items()):
-                print(f"  {app_name}: {status}")
+                plan = deployment_plans.get(app_name, {})
+                strategy = plan.get('strategy', 'N/A')
+                group = plan.get('deploymentGroup', 'N/A')
+                print(f"  {app_name}: {status} (Deploy: {strategy} in {group})")
             print("\n[DRY-RUN] Would export applications and analyze TQL for custom components")
             return {}
 
@@ -402,11 +418,13 @@ class StriimUpgradeManager:
                 app = parts[1] if len(parts) > 1 else parts[0]
                 self.state.add_app_component(
                     namespace, app, comp['type'], comp['name'], comp['create_statement'],
-                    drop_type=comp.get('component_type', 'SOURCE')
+                    drop_type=comp.get('component_type', 'SOURCE'),
+                    flow=comp.get('flow')
                 )
 
-        # Save application states
+        # Save application states and deployment plans
         self.state.state['app_states'] = app_states
+        self.state.state['deployment_plans'] = deployment_plans
 
         self.state.set_phase('analyzed')
 
@@ -517,6 +535,9 @@ class StriimUpgradeManager:
             # Try to find which app this belongs to
             app_name = self._find_app_for_component(tql_content, namespace, name, apps_found)
             if app_name:
+                # Find which flow (if any) this component belongs to
+                flow_name = self._find_flow_for_component(tql_content, match.start())
+
                 if app_name not in components:
                     components[app_name] = []
                 components[app_name].append({
@@ -525,6 +546,7 @@ class StriimUpgradeManager:
                     'simple_name': simple_name,  # For DROP command
                     'component_type': component_type,  # For DROP command (SOURCE or OPEN PROCESSOR)
                     'adapter': adapter,
+                    'flow': flow_name,  # Flow name if inside a FLOW block, None otherwise
                     'create_statement': self._extract_full_statement(tql_content, match.start())
                 })
 
@@ -592,11 +614,135 @@ class StriimUpgradeManager:
         return components
 
     def _extract_full_statement(self, tql: str, start_pos: int) -> str:
-        """Extract full CREATE statement ending with semicolon"""
-        end_pos = tql.find(';', start_pos)
+        """Extract full CREATE statement ending with semicolon
+
+        Properly handles nested parentheses in CREATE SOURCE/OP statements.
+        The statement structure is:
+        CREATE [OR REPLACE] SOURCE name USING library ( properties ) OUTPUT TO target;
+
+        We need to find the matching closing ) for the properties, then find the ; after that.
+        """
+        # Find the opening parenthesis for the properties section
+        paren_start = tql.find('(', start_pos)
+        if paren_start == -1:
+            # No parentheses, just find the semicolon
+            end_pos = tql.find(';', start_pos)
+            if end_pos == -1:
+                end_pos = len(tql)
+            return tql[start_pos:end_pos+1].strip()
+
+        # Count parentheses to find the matching closing one
+        paren_count = 0
+        pos = paren_start
+        paren_end = -1
+
+        while pos < len(tql):
+            if tql[pos] == '(':
+                paren_count += 1
+            elif tql[pos] == ')':
+                paren_count -= 1
+                if paren_count == 0:
+                    paren_end = pos
+                    break
+            pos += 1
+
+        if paren_end == -1:
+            # Couldn't find matching closing paren, fall back to semicolon
+            end_pos = tql.find(';', start_pos)
+            if end_pos == -1:
+                end_pos = len(tql)
+            return tql[start_pos:end_pos+1].strip()
+
+        # Now find the semicolon after the closing parenthesis
+        end_pos = tql.find(';', paren_end)
         if end_pos == -1:
             end_pos = len(tql)
+
         return tql[start_pos:end_pos+1].strip()
+
+    def _get_deployment_plans(self, app_states: Dict[str, str]) -> Dict[str, Dict]:
+        """Get deployment plans for deployed/running applications
+
+        Handles both single-flow and multi-flow applications.
+
+        Returns a dict mapping app_name to deployment plan:
+        {
+            'admin.MyApp': {
+                'application': {
+                    'strategy': 'ON_ONE',
+                    'deploymentGroup': 'default'
+                },
+                'flows': {
+                    'Flow1': {
+                        'strategy': 'ON_ALL',
+                        'deploymentGroup': 'agent'
+                    },
+                    'Flow2': {
+                        'strategy': 'ON_ONE',
+                        'deploymentGroup': 'default'
+                    }
+                }
+            }
+        }
+        """
+        deployment_plans = {}
+
+        for app_name, status in app_states.items():
+            # Only get deployment plans for deployed or running apps
+            if status not in ['DEPLOYED', 'RUNNING']:
+                continue
+
+            # Execute DESCRIBE command
+            result = self.api.execute_command(f"DESCRIBE {app_name};")
+            if not result or not isinstance(result, list) or len(result) == 0:
+                continue
+
+            # Extract deployment plan from response
+            output = result[0].get('output', [])
+            if not output or len(output) == 0:
+                continue
+
+            app_info = output[0]
+            deployment_plan_raw = app_info.get('deploymentPlan')
+
+            if not deployment_plan_raw:
+                continue
+
+            # Handle both single-flow (dict) and multi-flow (list) cases
+            plan_data = {
+                'application': {},
+                'flows': {}
+            }
+
+            if isinstance(deployment_plan_raw, dict):
+                # Single-flow app: deploymentPlan is a dict
+                plan_data['application'] = {
+                    'strategy': deployment_plan_raw.get('strategy', 'ON_ONE'),
+                    'deploymentGroup': deployment_plan_raw.get('deploymentGroup', 'default')
+                }
+            elif isinstance(deployment_plan_raw, list):
+                # Multi-flow app: deploymentPlan is a list
+                for plan in deployment_plan_raw:
+                    flow_type = plan.get('flowType')
+                    flow_name = plan.get('flowName')
+                    strategy = plan.get('strategy', 'ON_ONE')
+                    deployment_group = plan.get('deploymentGroup', 'default')
+
+                    if flow_type == 'APPLICATION':
+                        plan_data['application'] = {
+                            'strategy': strategy,
+                            'deploymentGroup': deployment_group
+                        }
+                    elif flow_type == 'FLOW':
+                        plan_data['flows'][flow_name] = {
+                            'strategy': strategy,
+                            'deploymentGroup': deployment_group
+                        }
+
+            if plan_data['application']:
+                deployment_plans[app_name] = plan_data
+
+        return deployment_plans
 
     def _find_cq_for_udf(self, tql: str, udf_name: str, apps_found: Set[str]) -> Optional[Tuple[str, str, str]]:
         """Find which CQ contains a UDF call and which app it belongs to
@@ -618,6 +764,26 @@ class StriimUpgradeManager:
                     # Extract the full CQ statement
                     cq_statement = self._extract_full_statement(tql, match.start())
                     return (app_name, full_cq_name, cq_statement)
+
+        return None
+
+    def _find_flow_for_component(self, tql: str, comp_position: int) -> Optional[str]:
+        """Find which FLOW (if any) a component belongs to
+
+        Returns the flow name if the component is inside a CREATE FLOW ... END FLOW block,
+        otherwise returns None (component is at application level)
+        """
+        # Find all FLOW blocks
+        flow_pattern = r'CREATE\s+FLOW\s+(\w+)\s*;?(.*?)END\s+FLOW\s+\1\s*;?'
+
+        for match in re.finditer(flow_pattern, tql, re.IGNORECASE | re.DOTALL):
+            flow_name = match.group(1)
+            flow_start = match.start()
+            flow_end = match.end()
+
+            # Check if component is within this flow block
+            if flow_start < comp_position < flow_end:
+                return flow_name
 
         return None
 
@@ -685,17 +851,26 @@ class StriimUpgradeManager:
                 comp_name = comp['name']
                 comp_type = comp['type']
                 component_type = comp.get('component_type', 'SOURCE')  # SOURCE or OPEN PROCESSOR
+                flow_name = comp.get('flow')  # Flow name if inside a FLOW block
 
                 if self.dry_run:
-                    print(f"  [DRY-RUN] Would remove {comp_type} {comp_name}")
+                    flow_info = f" (in FLOW {flow_name})" if flow_name else ""
+                    print(f"  [DRY-RUN] Would remove {comp_type} {comp_name}{flow_info}")
                     continue
 
                 # Send ALTER, DROP, RECOMPILE as a single batch command
-                print(f"  Removing {comp_type} {comp_name}...")
+                flow_info = f" from FLOW {flow_name}" if flow_name else ""
+                print(f"  Removing {comp_type} {comp_name}{flow_info}...")
 
                 # DROP command needs the component type (SOURCE or OPEN PROCESSOR)
                 drop_cmd = f"DROP {component_type} {comp_name};"
-                batch_cmd = f"ALTER APPLICATION {app_name};\n{drop_cmd}\nALTER APPLICATION {app_name} RECOMPILE;"
+
+                # If component is in a FLOW, wrap in ALTER FLOW ... END FLOW
+                if flow_name:
+                    batch_cmd = f"ALTER APPLICATION {app_name};\nALTER FLOW {flow_name};\n{drop_cmd}\nEND FLOW {flow_name};\nALTER APPLICATION {app_name} RECOMPILE;"
+                else:
+                    batch_cmd = f"ALTER APPLICATION {app_name};\n{drop_cmd}\nALTER APPLICATION {app_name} RECOMPILE;"
+
                 result = self.api.execute_command(batch_cmd)
 
                 if result:
@@ -964,24 +1139,32 @@ class StriimUpgradeManager:
                 create_stmt = comp['create_statement']
                 component_type = comp['component_type']  # SOURCE or OPEN PROCESSOR
                 simple_name = comp.get('simple_name', comp_name)  # Use simple name for DROP
+                flow_name = comp.get('flow')  # Flow name if inside a FLOW block
 
                 if self.dry_run:
-                    print(f"  [DRY-RUN] Would restore {comp_type} {comp_name}")
+                    flow_info = f" (in FLOW {flow_name})" if flow_name else ""
+                    print(f"  [DRY-RUN] Would restore {comp_type} {comp_name}{flow_info}")
                     continue
 
                 # Restore component in steps
-                print(f"  Restoring {comp_type} {comp_name}...")
+                flow_info = f" to FLOW {flow_name}" if flow_name else ""
+                print(f"  Restoring {comp_type} {comp_name}{flow_info}...")
 
                 # Step 1: ALTER APPLICATION
                 alter_cmd = f"ALTER APPLICATION {app_name};"
                 self.api.execute_command(alter_cmd)
 
-                # Step 2: Try to DROP first (in case it exists in a ghost state)
+                # Step 2: If in a FLOW, ALTER FLOW
+                if flow_name:
+                    alter_flow_cmd = f"ALTER FLOW {flow_name};"
+                    self.api.execute_command(alter_flow_cmd)
+
+                # Step 3: Try to DROP first (in case it exists in a ghost state)
                 # Use simple name for DROP (without namespace)
                 drop_cmd = f"DROP {component_type} {simple_name};"
                 self.api.execute_command(drop_cmd)  # Ignore errors if it doesn't exist
 
-                # Step 3: CREATE the component (use CREATE OR REPLACE if possible)
+                # Step 4: CREATE the component (use CREATE OR REPLACE if possible)
                 # Replace CREATE with CREATE OR REPLACE to handle existing components
                 if create_stmt.strip().upper().startswith('CREATE SOURCE'):
                     create_stmt_safe = create_stmt.replace('CREATE SOURCE', 'CREATE OR REPLACE SOURCE', 1)
@@ -994,7 +1177,12 @@ class StriimUpgradeManager:
 
                 result = self.api.execute_command(create_stmt_safe)
 
-                # Step 4: RECOMPILE
+                # Step 5: If in a FLOW, END FLOW
+                if flow_name:
+                    end_flow_cmd = f"END FLOW {flow_name};"
+                    self.api.execute_command(end_flow_cmd)
+
+                # Step 6: RECOMPILE
                 recompile_cmd = f"ALTER APPLICATION {app_name} RECOMPILE;"
                 self.api.execute_command(recompile_cmd)
 
@@ -1013,7 +1201,7 @@ class StriimUpgradeManager:
         print("\n[OK] All components restored to applications")
 
     def restore_app_states(self):
-        """Restore applications to their original states (DEPLOYED/RUNNING)"""
+        """Restore applications to their original states (DEPLOYED/RUNNING) and deployment groups"""
         print("\n=== Restoring Application States ===")
 
         if not self.state.state.get('app_states'):
@@ -1025,6 +1213,7 @@ class StriimUpgradeManager:
             return
 
         app_states = self.state.state['app_states']
+        deployment_plans = self.state.state.get('deployment_plans', {})
         apps_with_components = set(self.state.state['apps_with_components'].keys())
 
         # Track which apps need state restoration
@@ -1048,25 +1237,72 @@ class StriimUpgradeManager:
         if apps_to_deploy:
             print(f"\nApplications to DEPLOY ({len(apps_to_deploy)}):")
             for app_name in apps_to_deploy:
-                print(f"  - {app_name}")
+                plan = deployment_plans.get(app_name, {})
+                app_plan = plan.get('application', {})
+                flows = plan.get('flows', {})
+                strategy = app_plan.get('strategy', 'ON_ONE')
+                group = app_plan.get('deploymentGroup', 'default')
+                print(f"  - {app_name} ({strategy} in {group})")
+                if flows:
+                    for flow_name, flow_plan in flows.items():
+                        print(f"      WITH {flow_name} ({flow_plan['strategy']} in {flow_plan['deploymentGroup']})")
 
         if apps_to_start:
             print(f"\nApplications to DEPLOY and START ({len(apps_to_start)}):")
             for app_name in apps_to_start:
-                print(f"  - {app_name}")
+                plan = deployment_plans.get(app_name, {})
+                app_plan = plan.get('application', {})
+                flows = plan.get('flows', {})
+                strategy = app_plan.get('strategy', 'ON_ONE')
+                group = app_plan.get('deploymentGroup', 'default')
+                print(f"  - {app_name} ({strategy} in {group})")
+                if flows:
+                    for flow_name, flow_plan in flows.items():
+                        print(f"      WITH {flow_name} ({flow_plan['strategy']} in {flow_plan['deploymentGroup']})")
 
         if not apps_to_deploy and not apps_to_start:
             print("\n[INFO] All applications are already in CREATED state, no action needed")
             return
 
         if self.dry_run:
-            print("\n[DRY-RUN] Would restore application states")
+            print("\n[DRY-RUN] Would restore application states with deployment plans")
             return
 
         # Deploy applications
         for app_name in apps_to_deploy:
+            plan = deployment_plans.get(app_name, {})
+            app_plan = plan.get('application', {})
+            flows = plan.get('flows', {})
+
+            strategy = app_plan.get('strategy', 'ON_ONE')
+            group = app_plan.get('deploymentGroup', 'default')
+
+            # Convert strategy to command format (ON_ONE -> ONE, ON_ALL -> ALL)
+            deploy_mode = strategy.replace('ON_', '')
+
+            # Build DEPLOY command with per-flow deployment groups
+            deploy_cmd = f"DEPLOY APPLICATION {app_name} ON {deploy_mode} IN {group}"
+
+            if flows:
+                # Add WITH clause for each flow
+                with_clauses = []
+                for flow_name, flow_plan in flows.items():
+                    flow_strategy = flow_plan['strategy'].replace('ON_', '')
+                    flow_group = flow_plan['deploymentGroup']
+                    with_clauses.append(f"{flow_name} ON {flow_strategy} IN {flow_group}")
+                deploy_cmd += " WITH " + ", ".join(with_clauses)
+
+            deploy_cmd += ";"
+
             print(f"\nDeploying {app_name}...")
-            result = self.api.execute_command(f"DEPLOY APPLICATION {app_name};")
+            if flows:
+                print(f"  App: {deploy_mode} in {group}")
+                for flow_name, flow_plan in flows.items():
+                    print(f"  {flow_name}: {flow_plan['strategy'].replace('ON_', '')} in {flow_plan['deploymentGroup']}")
+            else:
+                print(f"  {deploy_mode} in {group}")
+
+            result = self.api.execute_command(deploy_cmd)
             if result:
                 print(f"  [OK] Deployed {app_name}")
             else:
@@ -1074,10 +1310,40 @@ class StriimUpgradeManager:
 
         # Deploy and start applications
         for app_name in apps_to_start:
+            plan = deployment_plans.get(app_name, {})
+            app_plan = plan.get('application', {})
+            flows = plan.get('flows', {})
+
+            strategy = app_plan.get('strategy', 'ON_ONE')
+            group = app_plan.get('deploymentGroup', 'default')
+
+            # Convert strategy to command format (ON_ONE -> ONE, ON_ALL -> ALL)
+            deploy_mode = strategy.replace('ON_', '')
+
+            # Build DEPLOY command with per-flow deployment groups
+            deploy_cmd = f"DEPLOY APPLICATION {app_name} ON {deploy_mode} IN {group}"
+
+            if flows:
+                # Add WITH clause for each flow
+                with_clauses = []
+                for flow_name, flow_plan in flows.items():
+                    flow_strategy = flow_plan['strategy'].replace('ON_', '')
+                    flow_group = flow_plan['deploymentGroup']
+                    with_clauses.append(f"{flow_name} ON {flow_strategy} IN {flow_group}")
+                deploy_cmd += " WITH " + ", ".join(with_clauses)
+
+            deploy_cmd += ";"
+
             print(f"\nDeploying and starting {app_name}...")
+            if flows:
+                print(f"  App: {deploy_mode} in {group}")
+                for flow_name, flow_plan in flows.items():
+                    print(f"  {flow_name}: {flow_plan['strategy'].replace('ON_', '')} in {flow_plan['deploymentGroup']}")
+            else:
+                print(f"  {deploy_mode} in {group}")
 
             # Deploy first
-            result = self.api.execute_command(f"DEPLOY APPLICATION {app_name};")
+            result = self.api.execute_command(deploy_cmd)
             if not result:
                 print(f"  [ERROR] Failed to deploy {app_name}")
                 continue
