@@ -493,9 +493,10 @@ class StriimUpgradeManager:
         # Patterns for CREATE statements - match with optional namespace
         # Matches: CREATE SOURCE name USING or CREATE SOURCE namespace.name USING
         op_pattern = r'CREATE\s+(?:OR\s+REPLACE\s+)?(?:OPEN\s+)?(?:SOURCE\s+|PROCESSOR\s+)(?:(\w+)\.)?(\w+)\s+USING\s+(\S+)'
-        # UDF calls pattern: matches multi-part function calls like com.striim.util.AdvFormat.FormatAllDates(...)
+        # UDF calls pattern: matches multi-part function calls like com.striim.util.AdvFormat.LowercaseTableName(...)
         # Must have at least 3 parts (package.class.method) to distinguish from Striim built-ins
-        udf_call_pattern = r'\b([a-z][a-z0-9]*(?:\.[a-z][a-z0-9]*){2,})\s*\('
+        # First part must be lowercase (package), subsequent parts can be any case (class/method names)
+        udf_call_pattern = r'\b([a-z][a-z0-9]*(?:\.[a-zA-Z][a-zA-Z0-9]*){2,})\s*\('
         app_pattern = r'CREATE\s+(?:OR\s+REPLACE\s+)?APPLICATION\s+(?:(\w+)\.)?(\w+)'
         cq_pattern = r'CREATE\s+(?:OR\s+REPLACE\s+)?CQ\s+(?:(\w+)\.)?(\w+)'
 
