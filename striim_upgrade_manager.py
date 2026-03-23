@@ -91,7 +91,7 @@ class UpgradeState:
 
     def add_app_component(self, namespace: str, app_name: str, component_type: str,
                          component_name: str, create_statement: str, drop_type: str = None,
-                         flow: str = None, simple_name: str = None):
+                         flow: str = None, simple_name: str = None, udfs: list = None):
         full_app_name = f"{namespace}.{app_name}"
         if full_app_name not in self.state['apps_with_components']:
             self.state['apps_with_components'][full_app_name] = []
@@ -100,7 +100,7 @@ class UpgradeState:
         # This prevents issues when executing commands via API
         clean_statement = ' '.join(create_statement.split())
 
-        self.state['apps_with_components'][full_app_name].append({
+        component_data = {
             'type': component_type,
             'name': component_name,
             'simple_name': simple_name or component_name.split('.')[-1],  # For DROP command
@@ -109,7 +109,13 @@ class UpgradeState:
             'app_name': app_name,
             'component_type': drop_type or 'SOURCE',  # For DROP command (SOURCE or OPEN PROCESSOR)
             'flow': flow  # Flow name if inside a FLOW block, None otherwise
-        })
+        }
+
+        # Add UDFs field for CQ components
+        if udfs:
+            component_data['udfs'] = udfs
+
+        self.state['apps_with_components'][full_app_name].append(component_data)
 
 
 class StriimAPI:
@@ -277,7 +283,8 @@ class StriimUpgradeManager:
                     namespace, app, comp['type'], comp['name'], comp['create_statement'],
                     drop_type=comp.get('component_type', 'SOURCE'),
                     flow=comp.get('flow'),
-                    simple_name=comp.get('simple_name')
+                    simple_name=comp.get('simple_name'),
+                    udfs=comp.get('udfs')  # Pass UDFs for CQ components
                 )
 
         # Save application states and deployment plans
