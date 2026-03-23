@@ -962,37 +962,83 @@ class StriimUpgradeManager:
         print("\n[OK] All components removed from applications")
 
     def unload_components(self):
-        """Unload OPs/UDFs from Striim"""
+        """Unload OPs/UDFs from Striim
+
+        This unloads the LIBRARIES (JAR files), not individual component instances.
+        For OPs: UNLOAD OPEN PROCESSOR '<library_name>';
+        For UDFs: UNLOAD UDF '<package_name>';
+        """
         print("\n=== Unloading Components from Striim ===")
 
         if not self.state.state['removed_components']:
             print("[WARN] No removed components found. Run --remove-from-apps first.")
             return
 
-        # Get unique component names across all apps
-        all_components = set()
+        # Get unique libraries to unload
+        libraries_to_unload = set()  # For Open Processors
+        udf_packages_to_unload = set()  # For UDFs
+
         for app_name, components in self.state.state['apps_with_components'].items():
             for comp in components:
-                all_components.add((comp['name'], comp['type']))
+                comp_type = comp['type']
 
-        for comp_name, comp_type in all_components:
+                if comp_type == 'OP':
+                    # For OPs, we need the library name from custom_libraries
+                    # The library name is stored in the component data
+                    library_name = comp.get('library_name')
+                    if library_name:
+                        libraries_to_unload.add(library_name)
+                    else:
+                        print(f"[WARN] No library_name found for OP {comp['name']}, skipping")
+
+                elif comp_type == 'CQ':
+                    # For CQs with UDFs, extract the package name (e.g., com.striim.util.AdvFormat)
+                    udfs = comp.get('udfs', [])
+                    for udf_full_name in udfs:
+                        # Extract package name (everything except the last part)
+                        # e.g., com.striim.util.AdvFormat.LowercaseTableName -> com.striim.util.AdvFormat
+                        parts = udf_full_name.rsplit('.', 1)
+                        if len(parts) > 1:
+                            package_name = parts[0]
+                            udf_packages_to_unload.add(package_name)
+
+        # Unload Open Processor libraries
+        for library_name in sorted(libraries_to_unload):
             if self.dry_run:
-                print(f"  [DRY-RUN] Would unload {comp_type} {comp_name}")
+                print(f"  [DRY-RUN] Would unload OPEN PROCESSOR '{library_name}'")
                 continue
 
-            print(f"  Unloading {comp_type} {comp_name}...")
-            unload_cmd = f"UNLOAD OPEN PROCESSOR '{comp_name}';" if comp_type == 'OP' else f"UNLOAD UDF '{comp_name}';"
+            print(f"  Unloading OPEN PROCESSOR '{library_name}'...")
+            unload_cmd = f"UNLOAD OPEN PROCESSOR '{library_name}';"
             result = self.api.execute_command(unload_cmd)
 
             if result:
-                self.state.state['unloaded_components'].append(comp_name)
-                print(f"  [OK] Unloaded {comp_name}")
+                self.state.state['unloaded_components'].append(f"OP:{library_name}")
+                print(f"  [OK] Unloaded {library_name}")
             else:
-                print(f"  [WARN] Failed to unload {comp_name}")
+                print(f"  [WARN] Failed to unload {library_name}")
+
+        # Unload UDF packages
+        for package_name in sorted(udf_packages_to_unload):
+            if self.dry_run:
+                print(f"  [DRY-RUN] Would unload UDF '{package_name}'")
+                continue
+
+            print(f"  Unloading UDF '{package_name}'...")
+            unload_cmd = f"UNLOAD UDF '{package_name}';"
+            result = self.api.execute_command(unload_cmd)
+
+            if result:
+                self.state.state['unloaded_components'].append(f"UDF:{package_name}")
+                print(f"  [OK] Unloaded {package_name}")
+            else:
+                print(f"  [WARN] Failed to unload {package_name}")
 
         if not self.dry_run:
             self.state.set_phase('components_unloaded')
-        print("\n[OK] All components unloaded")
+
+        total_unloaded = len(libraries_to_unload) + len(udf_packages_to_unload)
+        print(f"\n[OK] Unloaded {len(libraries_to_unload)} OP library(ies) and {len(udf_packages_to_unload)} UDF package(s) (total: {total_unloaded})")
 
     def load_components(self, component_path: str = None):
         """Load new OPs/UDFs after upgrade"""
