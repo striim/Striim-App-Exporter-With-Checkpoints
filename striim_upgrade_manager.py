@@ -650,7 +650,7 @@ class StriimUpgradeManager:
         print("\n=== Loading Components ===")
 
         if component_path:
-            # Load specific component
+            # Load specific component (manual mode)
             if self.dry_run:
                 print(f"  [DRY-RUN] Would load {component_path}")
                 return
@@ -666,17 +666,174 @@ class StriimUpgradeManager:
             else:
                 print(f"  [ERROR] Failed to load {component_path}")
         else:
-            print("[INFO] Please specify --component-path to load components")
-            print("[INFO] Example: --load-components --component-path UploadedFiles/MyOP.scm")
-            print("\n[INFO] Components that need to be loaded:")
+            # Interactive mode - map old components to new versions
+            self._interactive_component_loading()
 
-            all_components = set()
-            for app_name, components in self.state.state['apps_with_components'].items():
-                for comp in components:
-                    all_components.add((comp['name'], comp['type']))
+    def _interactive_component_loading(self):
+        """Interactive mode to map old component versions to new ones"""
+        # Get list of components that were unloaded
+        if not self.state.state.get('unloaded_components'):
+            print("[WARN] No components were unloaded. Nothing to load.")
+            print("[INFO] If you want to load a specific component, use:")
+            print("       --load-components --component-path UploadedFiles/YourComponent.jar")
+            return
 
-            for comp_name, comp_type in all_components:
-                print(f"  - {comp_type}: {comp_name}")
+        unloaded = self.state.state['unloaded_components']
+        print(f"\n[INFO] Found {len(unloaded)} component(s) that were unloaded:")
+        for comp in unloaded:
+            print(f"  - {comp}")
+
+        # Get list of available files in UploadedFiles/
+        print("\n[INFO] Fetching available files from UploadedFiles/...")
+        available_files = self._get_uploaded_files()
+
+        if not available_files:
+            print("[ERROR] No files found in UploadedFiles/")
+            print("[INFO] Please upload your new component files via Striim UI first")
+            return
+
+        print(f"[OK] Found {len(available_files)} file(s) in UploadedFiles/:")
+        for f in available_files:
+            print(f"  - {f}")
+
+        # Build mapping with auto-suggestions
+        print("\n=== Component Mapping ===")
+        print("Mapping old components to new versions...\n")
+
+        component_mapping = {}
+        for old_comp in unloaded:
+            # Extract base name (e.g., "StriimWatcher" from "StriimWatcher-5.2.0.5.jar")
+            base_name = self._extract_base_name(old_comp)
+
+            # Find matching files
+            matches = [f for f in available_files if base_name.lower() in f.lower()]
+
+            if len(matches) == 1:
+                # Auto-match if only one candidate
+                suggested = matches[0]
+                print(f"Old: {old_comp}")
+                print(f"New: {suggested} (auto-matched)")
+
+                if not self.dry_run:
+                    confirm = input("Accept this mapping? (yes/no/manual): ").strip().lower()
+                    if confirm == 'yes' or confirm == 'y':
+                        component_mapping[old_comp] = f"UploadedFiles/{suggested}"
+                    elif confirm == 'manual' or confirm == 'm':
+                        component_mapping[old_comp] = self._manual_file_selection(old_comp, available_files)
+                    else:
+                        print(f"  [SKIP] Skipping {old_comp}")
+                else:
+                    component_mapping[old_comp] = f"UploadedFiles/{suggested}"
+
+            elif len(matches) > 1:
+                # Multiple matches - let user choose
+                print(f"Old: {old_comp}")
+                print(f"Found {len(matches)} possible matches:")
+                for i, match in enumerate(matches, 1):
+                    print(f"  {i}. {match}")
+
+                if not self.dry_run:
+                    choice = input(f"Select 1-{len(matches)} or 's' to skip: ").strip()
+                    if choice.lower() == 's':
+                        print(f"  [SKIP] Skipping {old_comp}")
+                    elif choice.isdigit() and 1 <= int(choice) <= len(matches):
+                        selected = matches[int(choice) - 1]
+                        component_mapping[old_comp] = f"UploadedFiles/{selected}"
+                        print(f"  [OK] Mapped to {selected}")
+                    else:
+                        print(f"  [SKIP] Invalid choice, skipping {old_comp}")
+                else:
+                    # In dry-run, use first match
+                    component_mapping[old_comp] = f"UploadedFiles/{matches[0]}"
+            else:
+                # No auto-match found
+                print(f"Old: {old_comp}")
+                print(f"No automatic match found for base name '{base_name}'")
+
+                if not self.dry_run:
+                    component_mapping[old_comp] = self._manual_file_selection(old_comp, available_files)
+                else:
+                    print(f"  [SKIP] Would prompt for manual selection")
+
+            print()  # Blank line between components
+
+        # Show final mapping
+        if component_mapping:
+            print("\n=== Final Component Mapping ===")
+            for old, new in component_mapping.items():
+                print(f"  {old} -> {new}")
+
+            # Load all components
+            if self.dry_run:
+                print("\n[DRY-RUN] Would load the above components")
+            else:
+                print("\n[INFO] Loading components...")
+                for old_comp, new_path in component_mapping.items():
+                    print(f"\nLoading {new_path}...")
+                    load_cmd = f"LOAD OPEN PROCESSOR '{new_path}';"
+                    result = self.api.execute_command(load_cmd)
+
+                    if result:
+                        self.state.state['loaded_components'].append(new_path)
+                        print(f"  [OK] Loaded {new_path}")
+                    else:
+                        print(f"  [ERROR] Failed to load {new_path}")
+
+                self.state.save()
+                print("\n[OK] Component loading complete")
+        else:
+            print("[WARN] No components were mapped")
+
+    def _extract_base_name(self, filename: str) -> str:
+        """Extract base name from versioned filename
+        Examples:
+          StriimWatcher-5.2.0.5.jar -> StriimWatcher
+          MyAdapter-1.0.jar -> MyAdapter
+          CustomOP.scm -> CustomOP
+        """
+        # Remove path if present
+        name = filename.split('/')[-1]
+        # Remove extension
+        name = name.rsplit('.', 1)[0]
+        # Remove version (everything after first dash or underscore)
+        for sep in ['-', '_']:
+            if sep in name:
+                name = name.split(sep)[0]
+                break
+        return name
+
+    def _get_uploaded_files(self) -> List[str]:
+        """Get list of files in UploadedFiles/ directory via API"""
+        # Use LIST LIBRARIES to see what's available
+        # This shows files that have been uploaded
+        result = self.api.execute_command("LIST LIBRARIES;")
+
+        files = []
+        if result and isinstance(result, list) and len(result) > 0:
+            output = result[0].get('output', [])
+            for item in output:
+                if 'fileName' in item:
+                    files.append(item['fileName'])
+
+        return files
+
+    def _manual_file_selection(self, old_comp: str, available_files: List[str]) -> Optional[str]:
+        """Let user manually select a file from the list"""
+        print(f"Available files:")
+        for i, f in enumerate(available_files, 1):
+            print(f"  {i}. {f}")
+
+        choice = input(f"Select 1-{len(available_files)} or 's' to skip: ").strip()
+        if choice.lower() == 's':
+            print(f"  [SKIP] Skipping {old_comp}")
+            return None
+        elif choice.isdigit() and 1 <= int(choice) <= len(available_files):
+            selected = available_files[int(choice) - 1]
+            print(f"  [OK] Mapped to {selected}")
+            return f"UploadedFiles/{selected}"
+        else:
+            print(f"  [SKIP] Invalid choice, skipping {old_comp}")
+            return None
 
     def restore_to_apps(self):
         """Restore OPs/UDFs to applications"""
