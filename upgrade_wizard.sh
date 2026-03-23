@@ -87,7 +87,42 @@ run_python_command() {
 }
 
 analyze_apps() {
-    run_python_command "--analyze" "Analyzing applications for OPs and UDFs..."
+    # Check if export file already exists
+    local export_file="$SCRIPT_DIR/upgrade_backup/all_applications.zip"
+
+    if [ -f "$export_file" ]; then
+        echo ""
+        print_info "Found existing export file: $export_file"
+        echo ""
+        echo "Choose analysis mode:"
+        echo "  1) Re-analyze from existing files (fast, no re-export)"
+        echo "  2) Full analysis (re-export and analyze)"
+        echo "  0) Cancel"
+        echo ""
+        read -p "Select: " choice
+
+        case $choice in
+            1)
+                run_python_command "--analyze-from-files" "Re-analyzing from existing TQL files..."
+                ;;
+            2)
+                run_python_command "--analyze" "Running full analysis (export and analyze)..."
+                ;;
+            0)
+                print_info "Cancelled"
+                read -p "Press Enter to continue..."
+                return
+                ;;
+            *)
+                print_error "Invalid option"
+                read -p "Press Enter to continue..."
+                return
+                ;;
+        esac
+    else
+        # No existing export, run full analysis
+        run_python_command "--analyze" "Analyzing applications for OPs and UDFs..."
+    fi
 }
 
 remove_from_apps() {
@@ -150,17 +185,19 @@ dry_run_menu() {
     print_header "Dry-Run Mode"
     echo ""
     echo "Select action to test:"
-    echo "  1) Analyze"
-    echo "  2) Remove from apps"
-    echo "  3) Unload components"
+    echo "  1) Analyze (full export)"
+    echo "  2) Analyze from existing files"
+    echo "  3) Remove from apps"
+    echo "  4) Unload components"
     echo "  0) Back"
     echo ""
     read -p "Select: " choice
 
     case $choice in
-        1) run_python_command "--dry-run --analyze" "Dry-run: Analyze" ;;
-        2) run_python_command "--dry-run --remove-from-apps" "Dry-run: Remove from apps" ;;
-        3) run_python_command "--dry-run --unload-components" "Dry-run: Unload components" ;;
+        1) run_python_command "--dry-run --analyze" "Dry-run: Analyze (full)" ;;
+        2) run_python_command "--dry-run --analyze-from-files" "Dry-run: Analyze from files" ;;
+        3) run_python_command "--dry-run --remove-from-apps" "Dry-run: Remove from apps" ;;
+        4) run_python_command "--dry-run --unload-components" "Dry-run: Unload components" ;;
         0) return ;;
         *) print_error "Invalid option"; read -p "Press Enter..."; ;;
     esac
