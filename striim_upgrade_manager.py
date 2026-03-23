@@ -587,11 +587,13 @@ class StriimUpgradeManager:
 
             udf_calls_found.add(udf_full_name)
 
-        # For each UDF call found, determine which CQ and app it belongs to
+        # For each UDF call found, determine which CQ(s) and app(s) it belongs to
         for udf_name in udf_calls_found:
-            # Find the CQ that contains this UDF call
-            cq_info = self._find_cq_for_udf(tql_content, udf_name, apps_found)
-            if cq_info:
+            # Find ALL CQs that contain this UDF call
+            cq_infos = self._find_cq_for_udf(tql_content, udf_name, apps_found)
+
+            # Process each CQ found
+            for cq_info in cq_infos:
                 app_name, cq_name, cq_statement = cq_info
                 if app_name not in components:
                     components[app_name] = []
@@ -753,13 +755,14 @@ class StriimUpgradeManager:
 
         return deployment_plans
 
-    def _find_cq_for_udf(self, tql: str, udf_name: str, apps_found: Set[str]) -> Optional[Tuple[str, str, str]]:
-        """Find which CQ contains a UDF call and which app it belongs to
-        Returns: (app_name, cq_name, cq_statement) or None
+    def _find_cq_for_udf(self, tql: str, udf_name: str, apps_found: Set[str]) -> List[Tuple[str, str, str]]:
+        """Find ALL CQs that contain a UDF call and which app they belong to
+        Returns: List of (app_name, cq_name, cq_statement) tuples
         """
         # Pattern to find CQ statements
         cq_pattern = r'CREATE\s+(?:OR\s+REPLACE\s+)?CQ\s+(?:(\w+)\.)?(\w+)\s+(.*?);;'
 
+        cqs_found = []
         for match in re.finditer(cq_pattern, tql, re.IGNORECASE | re.DOTALL):
             namespace, cq_name, cq_body = match.groups()
 
@@ -772,9 +775,9 @@ class StriimUpgradeManager:
                 if app_name:
                     # Extract the full CQ statement
                     cq_statement = self._extract_full_statement(tql, match.start())
-                    return (app_name, full_cq_name, cq_statement)
+                    cqs_found.append((app_name, full_cq_name, cq_statement))
 
-        return None
+        return cqs_found
 
     def _find_flow_for_component(self, tql: str, comp_position: int) -> Optional[str]:
         """Find which FLOW (if any) a component belongs to
