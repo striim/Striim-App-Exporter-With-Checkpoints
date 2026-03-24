@@ -1366,6 +1366,16 @@ class StriimUpgradeManager:
             self.state.set_phase('components_restored')
         print("\n[OK] All components restored to applications")
 
+        # Automatically restore app states (DEPLOY/START) after components are restored
+        print("\n" + "="*60)
+        print("DEPLOYMENT PHASE")
+        print("="*60)
+        print("\n[INFO] Now restoring application states (DEPLOY/START)...")
+        print("[INFO] This will deploy/start all apps that were previously RUNNING/DEPLOYED")
+
+        # Call restore_all_app_states to handle deployment
+        self.restore_all_app_states()
+
     def restore_app_states(self):
         """Restore applications to their original states (DEPLOYED/RUNNING) and deployment groups"""
         print("\n=== Restoring Application States ===")
@@ -1530,6 +1540,166 @@ class StriimUpgradeManager:
         self.state.set_phase('states_restored')
         print("\n[OK] Application states restored")
 
+    def restore_all_app_states(self):
+        """Restore ALL applications to their original states (DEPLOYED/RUNNING), not just those with components
+
+        This is useful when you want to restore the entire environment state after an upgrade,
+        regardless of whether apps had custom components.
+        """
+        print("\n=== Restoring ALL Application States ===")
+
+        if not self.state.state.get('app_states'):
+            print("[WARN] No application states found. Run --analyze first.")
+            return
+
+        app_states = self.state.state['app_states']
+        deployment_plans = self.state.state.get('deployment_plans', {})
+
+        # Track which apps need state restoration (ALL apps, not just those with components)
+        apps_to_deploy = []
+        apps_to_start = []
+
+        for app_name, original_state in app_states.items():
+            if original_state == 'DEPLOYED':
+                apps_to_deploy.append(app_name)
+            elif original_state == 'RUNNING':
+                apps_to_start.append(app_name)
+            elif original_state in ['HALTED', 'TERMINATED']:
+                # HALTED/TERMINATED apps should be restored to DEPLOYED state
+                apps_to_deploy.append(app_name)
+                print(f"[INFO] {app_name} was {original_state}, will restore to DEPLOYED")
+            elif original_state == 'CREATED':
+                # Already in correct state, no action needed
+                pass
+            else:
+                print(f"[WARN] Unknown state '{original_state}' for {app_name}, skipping")
+
+        # Display what will be done
+        if apps_to_deploy:
+            print(f"\nApplications to DEPLOY ({len(apps_to_deploy)}):")
+            for app_name in apps_to_deploy:
+                plan = deployment_plans.get(app_name, {})
+                app_plan = plan.get('application', {})
+                flows = plan.get('flows', {})
+                strategy = app_plan.get('strategy', 'ON_ONE')
+                group = app_plan.get('deploymentGroup', 'default')
+                print(f"  - {app_name} ({strategy} in {group})")
+                if flows:
+                    for flow_name, flow_plan in flows.items():
+                        print(f"      WITH {flow_name} ({flow_plan['strategy']} in {flow_plan['deploymentGroup']})")
+
+        if apps_to_start:
+            print(f"\nApplications to DEPLOY and START ({len(apps_to_start)}):")
+            for app_name in apps_to_start:
+                plan = deployment_plans.get(app_name, {})
+                app_plan = plan.get('application', {})
+                flows = plan.get('flows', {})
+                strategy = app_plan.get('strategy', 'ON_ONE')
+                group = app_plan.get('deploymentGroup', 'default')
+                print(f"  - {app_name} ({strategy} in {group})")
+                if flows:
+                    for flow_name, flow_plan in flows.items():
+                        print(f"      WITH {flow_name} ({flow_plan['strategy']} in {flow_plan['deploymentGroup']})")
+
+        if not apps_to_deploy and not apps_to_start:
+            print("\n[INFO] All applications are already in CREATED state, no action needed")
+            return
+
+        if self.dry_run:
+            print("\n[DRY-RUN] Would restore application states with deployment plans")
+            return
+
+        # Deploy applications
+        for app_name in apps_to_deploy:
+            plan = deployment_plans.get(app_name, {})
+            app_plan = plan.get('application', {})
+            flows = plan.get('flows', {})
+
+            strategy = app_plan.get('strategy', 'ON_ONE')
+            group = app_plan.get('deploymentGroup', 'default')
+
+            # Convert strategy to command format (ON_ONE -> ONE, ON_ALL -> ALL)
+            deploy_mode = strategy.replace('ON_', '')
+
+            # Build DEPLOY command with per-flow deployment groups
+            deploy_cmd = f"DEPLOY APPLICATION {app_name} ON {deploy_mode} IN {group}"
+
+            if flows:
+                # Add WITH clause for each flow
+                with_clauses = []
+                for flow_name, flow_plan in flows.items():
+                    flow_strategy = flow_plan['strategy'].replace('ON_', '')
+                    flow_group = flow_plan['deploymentGroup']
+                    with_clauses.append(f"{flow_name} ON {flow_strategy} IN {flow_group}")
+                deploy_cmd += " WITH " + ", ".join(with_clauses)
+
+            deploy_cmd += ";"
+
+            print(f"\nDeploying {app_name}...")
+            if flows:
+                print(f"  App: {deploy_mode} in {group}")
+                for flow_name, flow_plan in flows.items():
+                    print(f"  {flow_name}: {flow_plan['strategy'].replace('ON_', '')} in {flow_plan['deploymentGroup']}")
+            else:
+                print(f"  {deploy_mode} in {group}")
+
+            result = self.api.execute_command(deploy_cmd)
+            if result:
+                print(f"  [OK] Deployed {app_name}")
+            else:
+                print(f"  [ERROR] Failed to deploy {app_name}")
+
+        # Deploy and start applications
+        for app_name in apps_to_start:
+            plan = deployment_plans.get(app_name, {})
+            app_plan = plan.get('application', {})
+            flows = plan.get('flows', {})
+
+            strategy = app_plan.get('strategy', 'ON_ONE')
+            group = app_plan.get('deploymentGroup', 'default')
+
+            # Convert strategy to command format (ON_ONE -> ONE, ON_ALL -> ALL)
+            deploy_mode = strategy.replace('ON_', '')
+
+            # Build DEPLOY command with per-flow deployment groups
+            deploy_cmd = f"DEPLOY APPLICATION {app_name} ON {deploy_mode} IN {group}"
+
+            if flows:
+                # Add WITH clause for each flow
+                with_clauses = []
+                for flow_name, flow_plan in flows.items():
+                    flow_strategy = flow_plan['strategy'].replace('ON_', '')
+                    flow_group = flow_plan['deploymentGroup']
+                    with_clauses.append(f"{flow_name} ON {flow_strategy} IN {flow_group}")
+                deploy_cmd += " WITH " + ", ".join(with_clauses)
+
+            deploy_cmd += ";"
+
+            print(f"\nDeploying and starting {app_name}...")
+            if flows:
+                print(f"  App: {deploy_mode} in {group}")
+                for flow_name, flow_plan in flows.items():
+                    print(f"  {flow_name}: {flow_plan['strategy'].replace('ON_', '')} in {flow_plan['deploymentGroup']}")
+            else:
+                print(f"  {deploy_mode} in {group}")
+
+            # Deploy first
+            result = self.api.execute_command(deploy_cmd)
+            if not result:
+                print(f"  [ERROR] Failed to deploy {app_name}")
+                continue
+            print(f"  [OK] Deployed {app_name}")
+
+            # Then start
+            result = self.api.execute_command(f"START APPLICATION {app_name};")
+            if result:
+                print(f"  [OK] Started {app_name}")
+            else:
+                print(f"  [ERROR] Failed to start {app_name}")
+
+        self.state.set_phase('all_states_restored')
+        print("\n[OK] All application states restored")
+
     def prepare_for_upgrade(self):
         """Run all pre-upgrade steps"""
         print("\n" + "="*60)
@@ -1581,14 +1751,18 @@ Examples:
   python striim_upgrade_manager.py --remove-from-apps
   python striim_upgrade_manager.py --unload-components
 
-  # After upgrade
+  # After upgrade (restore components AND deploy/start apps automatically)
   python striim_upgrade_manager.py --load-components --component-path UploadedFiles/MyOP.scm
-  python striim_upgrade_manager.py --restore-to-apps
-  python striim_upgrade_manager.py --restore-app-states
+  python striim_upgrade_manager.py --restore-to-apps  # This now auto-deploys/starts apps!
+
+  # Manual deployment control (if needed)
+  python striim_upgrade_manager.py --restore-app-states          # Apps with OPs/UDFs only
+  python striim_upgrade_manager.py --restore-all-app-states      # ALL apps
 
   # Dry run mode (preview any action)
   python striim_upgrade_manager.py --dry-run --remove-from-apps
-  python striim_upgrade_manager.py --dry-run --restore-app-states
+  python striim_upgrade_manager.py --dry-run --restore-to-apps   # Preview component restore + deployment
+  python striim_upgrade_manager.py --dry-run --restore-all-app-states
 
   # Check status
   python striim_upgrade_manager.py --status
@@ -1607,9 +1781,11 @@ Examples:
     parser.add_argument('--load-components', action='store_true',
                        help='Load new OPs/UDFs (requires --component-path)')
     parser.add_argument('--restore-to-apps', action='store_true',
-                       help='Restore OPs/UDFs to apps (ALTER, CREATE, RECOMPILE)')
+                       help='Restore OPs/UDFs to apps (ALTER, CREATE, RECOMPILE) and auto-deploy/start apps')
     parser.add_argument('--restore-app-states', action='store_true',
-                       help='Restore applications to their original states (DEPLOYED/RUNNING)')
+                       help='Restore applications to their original states (DEPLOYED/RUNNING) - only apps with OPs/UDFs')
+    parser.add_argument('--restore-all-app-states', action='store_true',
+                       help='Restore ALL applications to their original states (DEPLOYED/RUNNING) - regardless of components')
     parser.add_argument('--prepare-for-upgrade', action='store_true',
                        help='Run all pre-upgrade steps (analyze, remove, unload)')
     parser.add_argument('--complete-upgrade', action='store_true',
@@ -1671,6 +1847,8 @@ Examples:
             manager.restore_to_apps()
         elif args.restore_app_states:
             manager.restore_app_states()
+        elif args.restore_all_app_states:
+            manager.restore_all_app_states()
         elif args.prepare_for_upgrade:
             manager.prepare_for_upgrade()
         elif args.complete_upgrade:

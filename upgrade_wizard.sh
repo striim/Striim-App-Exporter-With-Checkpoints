@@ -51,11 +51,13 @@ show_menu() {
     echo "POST-UPGRADE STEPS:"
     echo "  5) Load new OP/UDF components"
     echo "  6) Restore OPs/UDFs to applications"
+    echo "  7) Restore app states (apps with OPs/UDFs only)"
+    echo "  8) Restore ALL app states (all RUNNING/DEPLOYED apps)"
     echo ""
     echo "UTILITIES:"
-    echo "  7) Check upgrade status"
-    echo "  8) Dry-run mode (test without changes)"
-    echo "  9) Reset upgrade state"
+    echo "  9) Check upgrade status"
+    echo " 10) Dry-run mode (test without changes)"
+    echo " 11) Reset upgrade state"
     echo ""
     echo "  0) Exit"
     echo ""
@@ -176,6 +178,35 @@ restore_to_apps() {
     run_python_command "--restore-to-apps" "Restoring OPs/UDFs to applications..."
 }
 
+restore_app_states() {
+    echo ""
+    print_info "This will DEPLOY/START applications that had OPs/UDFs and were RUNNING/DEPLOYED"
+    print_info "A preview will be shown before execution"
+    echo ""
+    read -p "Continue? (yes/no): " confirm
+    if [ "$confirm" != "yes" ]; then
+        print_info "Cancelled"
+        read -p "Press Enter to continue..."
+        return
+    fi
+    run_python_command "--restore-app-states" "Restoring application states (apps with OPs/UDFs)..."
+}
+
+restore_all_app_states() {
+    echo ""
+    print_warning "This will DEPLOY/START ALL applications that were RUNNING/DEPLOYED"
+    print_warning "This includes apps WITHOUT custom components!"
+    print_info "A preview will be shown before execution"
+    echo ""
+    read -p "Are you sure? (yes/no): " confirm
+    if [ "$confirm" != "yes" ]; then
+        print_info "Cancelled"
+        read -p "Press Enter to continue..."
+        return
+    fi
+    run_python_command "--restore-all-app-states" "Restoring ALL application states..."
+}
+
 check_status() {
     run_python_command "--status" "Checking upgrade status..."
 }
@@ -189,6 +220,9 @@ dry_run_menu() {
     echo "  2) Analyze from existing files"
     echo "  3) Remove from apps"
     echo "  4) Unload components"
+    echo "  5) Restore to apps"
+    echo "  6) Restore app states (apps with OPs/UDFs)"
+    echo "  7) Restore ALL app states"
     echo "  0) Back"
     echo ""
     read -p "Select: " choice
@@ -198,6 +232,9 @@ dry_run_menu() {
         2) run_python_command "--dry-run --analyze-from-files" "Dry-run: Analyze from files" ;;
         3) run_python_command "--dry-run --remove-from-apps" "Dry-run: Remove from apps" ;;
         4) run_python_command "--dry-run --unload-components" "Dry-run: Unload components" ;;
+        5) run_python_command "--dry-run --restore-to-apps" "Dry-run: Restore to apps" ;;
+        6) run_python_command "--dry-run --restore-app-states" "Dry-run: Restore app states (with OPs/UDFs)" ;;
+        7) run_python_command "--dry-run --restore-all-app-states" "Dry-run: Restore ALL app states" ;;
         0) return ;;
         *) print_error "Invalid option"; read -p "Press Enter..."; ;;
     esac
@@ -234,9 +271,11 @@ main() {
             4) prepare_for_upgrade ;;
             5) load_components ;;
             6) restore_to_apps ;;
-            7) check_status ;;
-            8) dry_run_menu ;;
-            9) reset_state ;;
+            7) restore_app_states ;;
+            8) restore_all_app_states ;;
+            9) check_status ;;
+            10) dry_run_menu ;;
+            11) reset_state ;;
             0)
                 echo ""
                 print_info "Exiting..."
