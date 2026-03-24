@@ -1289,8 +1289,34 @@ class StriimUpgradeManager:
             print(f"  [SKIP] Invalid choice, skipping {old_comp}")
             return None
 
+    def _make_create_or_replace(self, create_stmt: str) -> str:
+        """Ensure a CREATE statement uses CREATE OR REPLACE to handle existing components"""
+        stmt_upper = create_stmt.strip().upper()
+        if stmt_upper.startswith('CREATE OR REPLACE'):
+            return create_stmt  # Already has OR REPLACE
+        if stmt_upper.startswith('CREATE SOURCE'):
+            return create_stmt.replace('CREATE SOURCE', 'CREATE OR REPLACE SOURCE', 1)
+        elif stmt_upper.startswith('CREATE OPEN PROCESSOR'):
+            return create_stmt.replace('CREATE OPEN PROCESSOR', 'CREATE OR REPLACE OPEN PROCESSOR', 1)
+        elif stmt_upper.startswith('CREATE CQ'):
+            return create_stmt.replace('CREATE CQ', 'CREATE OR REPLACE CQ', 1)
+        return create_stmt
+
     def restore_to_apps(self):
-        """Restore OPs/UDFs to applications"""
+        """Restore OPs/UDFs/CQs to applications using batched commands.
+
+        Groups all components for each application into a single batch command,
+        preserving flow structure:
+          ALTER APPLICATION <name>;
+          <app-level components>
+          ALTER FLOW <flow1>;
+          <flow1 components>
+          END FLOW <flow1>;
+          ALTER FLOW <flow2>;
+          <flow2 components>
+          END FLOW <flow2>;
+          ALTER APPLICATION <name> RECOMPILE;
+        """
         print("\n=== Restoring Components to Applications ===")
 
         if not self.state.state['apps_with_components']:
@@ -1316,51 +1342,73 @@ class StriimUpgradeManager:
                     print(f"  Undeploying {app_name}...")
                     self.api.execute_command(f"UNDEPLOY APPLICATION {app_name};")
 
+            # Group components by flow: None = app-level, flow_name = in that flow
+            app_level_components = []
+            flow_components = {}  # flow_name -> [components]
+
             for comp in components:
-                comp_name = comp['name']
-                comp_type = comp['type']
-                create_stmt = comp['create_statement']
-                flow_name = comp.get('flow')  # Flow name if inside a FLOW block
-
-                if self.dry_run:
-                    flow_info = f" (in FLOW {flow_name})" if flow_name else ""
-                    print(f"  [DRY-RUN] Would restore {comp_type} {comp_name}{flow_info}")
-                    continue
-
-                # Restore component as a single batch command
-                flow_info = f" to FLOW {flow_name}" if flow_name else ""
-                print(f"  Restoring {comp_type} {comp_name}{flow_info}...")
-
-                # Replace CREATE with CREATE OR REPLACE to handle existing components
-                if create_stmt.strip().upper().startswith('CREATE SOURCE'):
-                    create_stmt_safe = create_stmt.replace('CREATE SOURCE', 'CREATE OR REPLACE SOURCE', 1)
-                elif create_stmt.strip().upper().startswith('CREATE OPEN PROCESSOR'):
-                    create_stmt_safe = create_stmt.replace('CREATE OPEN PROCESSOR', 'CREATE OR REPLACE OPEN PROCESSOR', 1)
-                elif create_stmt.strip().upper().startswith('CREATE CQ'):
-                    create_stmt_safe = create_stmt.replace('CREATE CQ', 'CREATE OR REPLACE CQ', 1)
-                else:
-                    create_stmt_safe = create_stmt
-
-                # Build single batch command: ALTER APPLICATION; [ALTER FLOW;] CREATE OR REPLACE; [END FLOW;] RECOMPILE;
+                flow_name = comp.get('flow')
                 if flow_name:
-                    batch_cmd = f"ALTER APPLICATION {app_name};\nALTER FLOW {flow_name};\n{create_stmt_safe}\nEND FLOW {flow_name};\nALTER APPLICATION {app_name} RECOMPILE;"
+                    if flow_name not in flow_components:
+                        flow_components[flow_name] = []
+                    flow_components[flow_name].append(comp)
                 else:
-                    batch_cmd = f"ALTER APPLICATION {app_name};\n{create_stmt_safe}\nALTER APPLICATION {app_name} RECOMPILE;"
+                    app_level_components.append(comp)
 
-                # Print the batch command for debugging
-                print(f"    [CMD] Executing batch command:")
-                for line in batch_cmd.split('\n'):
-                    print(f"          {line}")
+            # Display what will be restored
+            print(f"  Components to restore:")
+            if app_level_components:
+                print(f"    App-level: {len(app_level_components)} component(s)")
+                for comp in app_level_components:
+                    print(f"      - {comp['type']}: {comp['name']}")
+            for flow_name, flow_comps in flow_components.items():
+                print(f"    Flow '{flow_name}': {len(flow_comps)} component(s)")
+                for comp in flow_comps:
+                    print(f"      - {comp['type']}: {comp['name']}")
 
-                # Execute as single batch
-                result = self.api.execute_command(batch_cmd)
+            if self.dry_run:
+                print(f"  [DRY-RUN] Would restore all components in a single batch command")
+                continue
 
-                if result and isinstance(result, list) and len(result) > 0 and result[0].get('failureMessage'):
-                    print(f"    [ERROR] {result[0]['failureMessage']}")
-                    print(f"  [ERROR] Failed to restore {comp_name}")
-                else:
-                    self.state.state['restored_apps'].append(app_name)
-                    print(f"  [OK] Restored {comp_name}")
+            # Build single batch command for ALL components in this app
+            batch_lines = []
+
+            # 1. ALTER APPLICATION
+            batch_lines.append(f"ALTER APPLICATION {app_name};")
+
+            # 2. App-level components (outside any flow)
+            for comp in app_level_components:
+                create_stmt = self._make_create_or_replace(comp['create_statement'])
+                batch_lines.append(create_stmt)
+
+            # 3. Flow-grouped components
+            for flow_name, flow_comps in flow_components.items():
+                batch_lines.append(f"ALTER FLOW {flow_name};")
+                for comp in flow_comps:
+                    create_stmt = self._make_create_or_replace(comp['create_statement'])
+                    batch_lines.append(create_stmt)
+                batch_lines.append(f"END FLOW {flow_name};")
+
+            # 4. RECOMPILE
+            batch_lines.append(f"ALTER APPLICATION {app_name} RECOMPILE;")
+
+            batch_cmd = "\n".join(batch_lines)
+
+            # Print the batch command for debugging
+            print(f"  [CMD] Executing batch command:")
+            for line in batch_cmd.split('\n'):
+                print(f"        {line}")
+
+            # Execute as single batch
+            result = self.api.execute_command(batch_cmd)
+
+            if result and isinstance(result, list) and len(result) > 0 and result[0].get('failureMessage'):
+                print(f"  [ERROR] {result[0]['failureMessage']}")
+                print(f"  [ERROR] Failed to restore components to {app_name}")
+            else:
+                self.state.state['restored_apps'].append(app_name)
+                total_restored = len(app_level_components) + sum(len(fc) for fc in flow_components.values())
+                print(f"  [OK] Restored {total_restored} component(s) to {app_name}")
 
         if not self.dry_run:
             self.state.set_phase('components_restored')
