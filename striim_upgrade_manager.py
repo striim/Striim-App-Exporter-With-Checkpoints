@@ -914,6 +914,12 @@ class StriimUpgradeManager:
             # Check app state - if RUNNING, need to STOP first, then UNDEPLOY
             app_state = self.state.state.get('app_states', {}).get(app_name, 'UNKNOWN')
 
+            # Handle transitional states - these should not be processed
+            if app_state in ['STARTING', 'STOPPING', 'DEPLOYING', 'UNDEPLOYING']:
+                print(f"  [ERROR] App {app_name} is in transitional state: {app_state}")
+                print(f"  [ERROR] Please wait for app to reach stable state before running upgrade")
+                continue
+
             if app_state == 'RUNNING':
                 if self.dry_run:
                     print(f"  [DRY-RUN] Would stop {app_name} (currently RUNNING)")
@@ -929,6 +935,11 @@ class StriimUpgradeManager:
                 else:
                     print(f"  Undeploying {app_name} (currently {app_state})...")
                     self.api.execute_command(f"UNDEPLOY APPLICATION {app_name};")
+            elif app_state in ['UNKNOWN', 'NOT_FOUND']:
+                # App exists as TQL file but is not deployed in Striim
+                # We can still modify the TQL via ALTER commands
+                print(f"  [INFO] App {app_name} is not currently deployed (state: {app_state})")
+                print(f"  [INFO] Will modify TQL file only (no UNDEPLOY needed)")
 
             for comp in components:
                 comp_name = comp['name']

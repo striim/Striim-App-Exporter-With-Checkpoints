@@ -1,18 +1,28 @@
 # Striim Upgrade Manager
 
-Automates the removal and restoration of Open Processors (OPs) and User-Defined Functions (UDFs) during Striim platform upgrades.
+Automates the removal and restoration of Open Processors (OPs), User-Defined Functions (UDFs), and Continuous Queries (CQs) with custom UDFs during Striim platform upgrades.
 
 ## Problem Statement
 
-When upgrading Striim from one version to another, custom components (OPs and UDFs) must be:
+When upgrading Striim from one version to another, custom components (OPs, UDFs, and CQs with UDFs) must be:
 1. Removed from applications before upgrade
-2. Unloaded from the platform
+2. Unloaded from the platform (libraries/JARs)
 3. Recompiled for the new version
 4. Loaded back into the platform
 5. Restored to applications
 6. Applications redeployed to their original deployment groups and states
 
 This tool automates this entire workflow and maintains state across the upgrade process, including tracking deployment groups and strategies (ON_ONE vs ON_ALL).
+
+## What Gets Detected and Removed
+
+The tool detects and handles three types of custom components:
+
+1. **Open Processors (OPs)**: Custom sources/processors using `USING <CustomAdapter>`
+2. **User-Defined Functions (UDFs)**: Custom functions in CQs (e.g., `com.striim.util.AdvFormat.LowercaseTableName()`)
+3. **Continuous Queries (CQs)**: CQs that call custom UDFs
+
+**Important:** CQs are detected and removed if they contain UDF calls, as the UDF libraries need to be upgraded.
 
 ## Components
 
@@ -74,20 +84,47 @@ python3 striim_upgrade_manager.py --restore-to-apps
    ```
 
 2. **Remove from Apps** - Executes for each app with components:
+
+   **For apps in RUNNING/DEPLOYED/HALTED/TERMINATED states:**
    ```sql
-   UNDEPLOY APPLICATION <name>;
+   STOP APPLICATION <name>;        -- Only if RUNNING
+   UNDEPLOY APPLICATION <name>;    -- For RUNNING/DEPLOYED/HALTED/TERMINATED
    ALTER APPLICATION <name>;
-   DROP <namespace>.<component>;  -- Just DROP with qualified name
+   DROP <component_type> <name>;   -- e.g., DROP SOURCE, DROP OPEN PROCESSOR, DROP CQ
    ALTER APPLICATION <name> RECOMPILE;
    ```
+
+   **Flow-scoped components** (components inside FLOW blocks):
+   ```sql
+   ALTER APPLICATION <name>;
+   ALTER FLOW <flow_name>;
+   DROP <component_type> <name>;
+   END FLOW <flow_name>;
+   ALTER APPLICATION <name> RECOMPILE;
+   ```
+
    ```bash
    python3 striim_upgrade_manager.py --remove-from-apps
    ```
 
-3. **Unload Components** - Removes components from Striim:
+3. **Unload Components** - Unloads ALL libraries from `LIST LIBRARIES`:
+
+   For each library, tries both commands:
    ```sql
-   UNLOAD OPEN PROCESSOR '<path>';  -- or UNLOAD UDF
+   UNLOAD 'UploadedFiles/<filename>';                    -- For UDFs (tries first)
+   UNLOAD OPEN PROCESSOR 'UploadedFiles/<filename>';     -- For OPs (tries if first fails)
    ```
+
+   Example output:
+   ```
+   Unloading 'UploadedFiles/AdvFormat-5.0.2.jar'...
+     [OK] Unloaded AdvFormat-5.0.2.jar (UDF)
+
+   Unloading 'UploadedFiles/EventChanger-5.2.0.scm'...
+     Trying as Open Processor...
+     [OK] Unloaded EventChanger-5.2.0.scm (OP)
+   ```
+
    ```bash
    python3 striim_upgrade_manager.py --unload-components
    ```
@@ -100,10 +137,22 @@ At this point, upgrade your Striim platform to the new version.
 
 4. **Upload New Components** - Use Striim UI to upload recompiled `.scm` or `.jar` files to `UploadedFiles/`
 
-5. **Load Components** - Load each component:
+5. **Load Components** - Load components (auto-detects OP vs UDF):
+
+   **Single file:**
    ```bash
    python3 striim_upgrade_manager.py --load-components --component-path UploadedFiles/MyOP.scm
    ```
+
+   **Multiple files (comma-separated):**
+   ```bash
+   python3 striim_upgrade_manager.py --load-components --component-path "AdvFormat-5.0.2.jar,EventChanger-5.2.0.scm,SoftDeleteUDF-1.0.0.jar"
+   ```
+
+   For each file, the tool automatically:
+   1. Tries `LOAD 'UploadedFiles/<filename>';` (for UDFs)
+   2. If that fails, tries `LOAD OPEN PROCESSOR 'UploadedFiles/<filename>';` (for OPs)
+   3. Reports which type it was (UDF or OP)
 
 6. **Restore to Apps** - Adds components back to applications:
    ```sql
@@ -117,7 +166,7 @@ At this point, upgrade your Striim platform to the new version.
 
 7. **Restore App States** - Returns applications to their original states and deployment groups:
    ```sql
-   DEPLOY APPLICATION <name> ON {ONE|ALL} IN <deployment_group>;  -- For apps that were DEPLOYED
+   DEPLOY APPLICATION <name> ON {ONE|ALL} IN <deployment_group>;  -- For apps that were DEPLOYED/HALTED/TERMINATED
    START APPLICATION <name>;   -- For apps that were RUNNING
    ```
    ```bash
@@ -127,7 +176,12 @@ At this point, upgrade your Striim platform to the new version.
    The tool automatically restores:
    - **Deployment strategy**: `ON_ONE` (single server) or `ON_ALL` (all servers in group)
    - **Deployment group**: The specific deployment group the app was running in
-   - **Application state**: DEPLOYED or RUNNING
+   - **Application state**:
+     - `RUNNING` → Restored to RUNNING (deployed + started)
+     - `DEPLOYED` → Restored to DEPLOYED
+     - `HALTED` → Restored to DEPLOYED (HALTED apps were undeployed during removal)
+     - `TERMINATED` → Restored to DEPLOYED (TERMINATED apps were undeployed during removal)
+     - `CREATED` → No action (stays CREATED)
 
 ## Command Reference
 
@@ -214,16 +268,48 @@ This creates a backup (`upgrade_state.json.backup.YYYYMMDD_HHMMSS`) before reset
 ## State Management
 
 The tool maintains state in `upgrade_state.json` to track:
-- Which applications have OPs/UDFs (including CQs with custom UDFs)
+- Which applications have OPs/UDFs/CQs (including CQs with custom UDFs)
 - Original CREATE statements for each component
-- Application states (RUNNING/DEPLOYED/CREATED)
+- **Flow information** (which FLOW each component belongs to, for correct scoping)
+- Application states (RUNNING/DEPLOYED/HALTED/TERMINATED/CREATED)
 - **Deployment plans** (deployment group and strategy: ON_ONE/ON_ALL)
+- **Library files** (mapping of library base names to full filenames from `LIST LIBRARIES`)
 - Which components have been removed
 - Which components have been unloaded
 - Which components have been loaded
 - Which apps have been restored
 
 This allows the upgrade process to be interrupted and resumed, and ensures applications are restored to their exact original deployment configuration.
+
+### Important State Fields
+
+**`library_files`**: Maps library base names to full filenames:
+```json
+{
+  "library_files": {
+    "AdvFormat": "AdvFormat-5.0.2.jar",
+    "EventChanger": "EventChanger-5.2.0.scm",
+    "SoftDeleteUDF": "SoftDeleteUDF-1.0.0.jar"
+  }
+}
+```
+
+**`apps_with_components`**: Tracks components and their flow scope:
+```json
+{
+  "apps_with_components": {
+    "DATALAKE.docutech_cdc": [
+      {
+        "type": "CQ",
+        "name": "tablename_lowercase_eq_cdc",
+        "flow": "docutech_cdc_transform_flow",
+        "component_type": "CQ",
+        "udfs": ["com.striim.util.AdvFormat.LowercaseTableName"]
+      }
+    ]
+  }
+}
+```
 
 ## Deployment Groups and Strategies
 
@@ -350,12 +436,98 @@ Ensure the component path is correct:
 
 Check Striim logs for compilation errors. The component may need code changes for the new version.
 
+### Apps Not Being Processed (State = NOT_FOUND)
+
+If you see apps with `NOT_FOUND` state during `--remove-from-apps`:
+
+**Cause:** The apps exist as TQL files but are not currently deployed in Striim, OR you're running the tool on a different Striim system than where the apps were exported from.
+
+**Solution:**
+1. **Re-run analyze on the current system:**
+   ```bash
+   python3 striim_upgrade_manager.py --analyze
+   ```
+   This will query the current Striim system for app states.
+
+2. **Check if apps are actually deployed:**
+   - Run `mon;` in Striim UI to see deployed apps
+   - Verify you're connected to the correct Striim instance in `config.py`
+
+### HALTED Apps Not Undeployed
+
+**Cause:** App states were not captured during analyze (shows as `NOT_FOUND` or `UNKNOWN`).
+
+**Solution:** Re-run `--analyze` to capture current app states from Striim.
+
+### Transitional State Errors (STARTING, DEPLOYING, etc.)
+
+If you see errors about apps in transitional states:
+
+**Cause:** Apps are in the process of starting/stopping/deploying when the tool runs.
+
+**Solution:** Wait for apps to reach stable state (RUNNING, DEPLOYED, CREATED) before running the upgrade manager.
+
+### Flow-Scoped Component Removal Issues
+
+If components in FLOW blocks are not being removed correctly:
+
+**Cause:** Flow detection may have failed during analyze.
+
+**Solution:**
+1. Check the `upgrade_state.json` for the `flow` field in component entries
+2. Re-run `--analyze-from-files` to re-analyze TQL files
+3. Verify TQL files use proper FLOW syntax:
+   ```sql
+   CREATE FLOW <flow_name>;
+     CREATE SOURCE ...
+     CREATE CQ ...
+   END FLOW <flow_name>;
+   ```
+
+## Key Features and Recent Fixes
+
+### Flow-Scoped Component Removal
+The tool correctly handles components inside FLOW blocks by using `ALTER FLOW` commands:
+```sql
+ALTER APPLICATION <name>;
+ALTER FLOW <flow_name>;
+DROP <component_type> <name>;
+END FLOW <flow_name>;
+ALTER APPLICATION <name> RECOMPILE;
+```
+
+This prevents errors where components in one flow would affect components in other flows.
+
+### CQ Detection with UDFs
+The tool detects CQs that call custom UDFs using the pattern:
+```
+com.striim.util.AdvFormat.LowercaseTableName(...)
+```
+
+CQs are removed and restored along with OPs and UDFs because they depend on the UDF libraries.
+
+### Library-Based Unload/Load
+Instead of tracking individual component instances, the tool:
+- Unloads ALL libraries from `LIST LIBRARIES` (not just detected components)
+- Auto-detects whether each library is an OP or UDF by trying both LOAD/UNLOAD commands
+- Handles multiple files in a single `--load-components` call
+
+### HALTED/TERMINATED App Support
+Apps in HALTED or TERMINATED states are now:
+- Properly undeployed before component removal
+- Restored to DEPLOYED state (not back to HALTED/TERMINATED)
+
+### Transitional State Detection
+The tool detects and warns about apps in transitional states (STARTING, DEPLOYING, etc.) that cannot be safely processed.
+
 ## Safety Features
 
 - **Dry-run mode** - Test without making changes
 - **State persistence** - Resume if interrupted
 - **Backup on reset** - State file backed up before deletion
 - **Confirmation prompts** - Interactive wizard asks for confirmation on destructive operations
+- **Flow-aware removal** - Correctly scopes DROP commands to the right FLOW
+- **Auto-detection** - Automatically determines OP vs UDF when loading/unloading
 
 ## Next Steps
 
