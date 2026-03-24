@@ -1423,10 +1423,14 @@ class StriimUpgradeManager:
                 flows = plan.get('flows', {})
                 strategy = app_plan.get('strategy', 'ON_ONE')
                 group = app_plan.get('deploymentGroup', 'default')
+                # Extract namespace for flow names
+                app_parts = app_name.split('.')
+                namespace = '.'.join(app_parts[:-1]) if len(app_parts) > 1 else ''
                 print(f"  - {app_name} ({strategy} in {group})")
                 if flows:
                     for flow_name, flow_plan in flows.items():
-                        print(f"      WITH {flow_name} ({flow_plan['strategy']} in {flow_plan['deploymentGroup']})")
+                        qualified_flow_name = f"{namespace}.{flow_name}" if namespace else flow_name
+                        print(f"      WITH {qualified_flow_name} ({flow_plan['strategy']} in {flow_plan['deploymentGroup']})")
 
         if apps_to_start:
             print(f"\nApplications to DEPLOY and START ({len(apps_to_start)}):")
@@ -1436,10 +1440,14 @@ class StriimUpgradeManager:
                 flows = plan.get('flows', {})
                 strategy = app_plan.get('strategy', 'ON_ONE')
                 group = app_plan.get('deploymentGroup', 'default')
+                # Extract namespace for flow names
+                app_parts = app_name.split('.')
+                namespace = '.'.join(app_parts[:-1]) if len(app_parts) > 1 else ''
                 print(f"  - {app_name} ({strategy} in {group})")
                 if flows:
                     for flow_name, flow_plan in flows.items():
-                        print(f"      WITH {flow_name} ({flow_plan['strategy']} in {flow_plan['deploymentGroup']})")
+                        qualified_flow_name = f"{namespace}.{flow_name}" if namespace else flow_name
+                        print(f"      WITH {qualified_flow_name} ({flow_plan['strategy']} in {flow_plan['deploymentGroup']})")
 
         if not apps_to_deploy and not apps_to_start:
             print("\n[INFO] All applications are already in CREATED state, no action needed")
@@ -1458,6 +1466,10 @@ class StriimUpgradeManager:
             strategy = app_plan.get('strategy', 'ON_ONE')
             group = app_plan.get('deploymentGroup', 'default')
 
+            # Extract namespace from app_name (e.g., "DATALAKE.myapp" -> "DATALAKE")
+            app_parts = app_name.split('.')
+            namespace = '.'.join(app_parts[:-1]) if len(app_parts) > 1 else ''
+
             # Convert strategy to command format (ON_ONE -> ONE, ON_ALL -> ALL)
             deploy_mode = strategy.replace('ON_', '')
 
@@ -1465,12 +1477,14 @@ class StriimUpgradeManager:
             deploy_cmd = f"DEPLOY APPLICATION {app_name} ON {deploy_mode} IN {group}"
 
             if flows:
-                # Add WITH clause for each flow
+                # Add WITH clause for each flow (with namespace prefix)
                 with_clauses = []
                 for flow_name, flow_plan in flows.items():
                     flow_strategy = flow_plan['strategy'].replace('ON_', '')
                     flow_group = flow_plan['deploymentGroup']
-                    with_clauses.append(f"{flow_name} ON {flow_strategy} IN {flow_group}")
+                    # Prepend namespace to flow name if namespace exists
+                    qualified_flow_name = f"{namespace}.{flow_name}" if namespace else flow_name
+                    with_clauses.append(f"{qualified_flow_name} ON {flow_strategy} IN {flow_group}")
                 deploy_cmd += " WITH " + ", ".join(with_clauses)
 
             deploy_cmd += ";"
@@ -1479,7 +1493,8 @@ class StriimUpgradeManager:
             if flows:
                 print(f"  App: {deploy_mode} in {group}")
                 for flow_name, flow_plan in flows.items():
-                    print(f"  {flow_name}: {flow_plan['strategy'].replace('ON_', '')} in {flow_plan['deploymentGroup']}")
+                    qualified_flow_name = f"{namespace}.{flow_name}" if namespace else flow_name
+                    print(f"  {qualified_flow_name}: {flow_plan['strategy'].replace('ON_', '')} in {flow_plan['deploymentGroup']}")
             else:
                 print(f"  {deploy_mode} in {group}")
 
@@ -1498,6 +1513,10 @@ class StriimUpgradeManager:
             strategy = app_plan.get('strategy', 'ON_ONE')
             group = app_plan.get('deploymentGroup', 'default')
 
+            # Extract namespace from app_name (e.g., "DATALAKE.myapp" -> "DATALAKE")
+            app_parts = app_name.split('.')
+            namespace = '.'.join(app_parts[:-1]) if len(app_parts) > 1 else ''
+
             # Convert strategy to command format (ON_ONE -> ONE, ON_ALL -> ALL)
             deploy_mode = strategy.replace('ON_', '')
 
@@ -1505,12 +1524,14 @@ class StriimUpgradeManager:
             deploy_cmd = f"DEPLOY APPLICATION {app_name} ON {deploy_mode} IN {group}"
 
             if flows:
-                # Add WITH clause for each flow
+                # Add WITH clause for each flow (with namespace prefix)
                 with_clauses = []
                 for flow_name, flow_plan in flows.items():
                     flow_strategy = flow_plan['strategy'].replace('ON_', '')
                     flow_group = flow_plan['deploymentGroup']
-                    with_clauses.append(f"{flow_name} ON {flow_strategy} IN {flow_group}")
+                    # Prepend namespace to flow name if namespace exists
+                    qualified_flow_name = f"{namespace}.{flow_name}" if namespace else flow_name
+                    with_clauses.append(f"{qualified_flow_name} ON {flow_strategy} IN {flow_group}")
                 deploy_cmd += " WITH " + ", ".join(with_clauses)
 
             deploy_cmd += ";"
@@ -1519,7 +1540,8 @@ class StriimUpgradeManager:
             if flows:
                 print(f"  App: {deploy_mode} in {group}")
                 for flow_name, flow_plan in flows.items():
-                    print(f"  {flow_name}: {flow_plan['strategy'].replace('ON_', '')} in {flow_plan['deploymentGroup']}")
+                    qualified_flow_name = f"{namespace}.{flow_name}" if namespace else flow_name
+                    print(f"  {qualified_flow_name}: {flow_plan['strategy'].replace('ON_', '')} in {flow_plan['deploymentGroup']}")
             else:
                 print(f"  {deploy_mode} in {group}")
 
@@ -1583,10 +1605,14 @@ class StriimUpgradeManager:
                 flows = plan.get('flows', {})
                 strategy = app_plan.get('strategy', 'ON_ONE')
                 group = app_plan.get('deploymentGroup', 'default')
+                # Extract namespace for flow names
+                app_parts = app_name.split('.')
+                namespace = '.'.join(app_parts[:-1]) if len(app_parts) > 1 else ''
                 print(f"  - {app_name} ({strategy} in {group})")
                 if flows:
                     for flow_name, flow_plan in flows.items():
-                        print(f"      WITH {flow_name} ({flow_plan['strategy']} in {flow_plan['deploymentGroup']})")
+                        qualified_flow_name = f"{namespace}.{flow_name}" if namespace else flow_name
+                        print(f"      WITH {qualified_flow_name} ({flow_plan['strategy']} in {flow_plan['deploymentGroup']})")
 
         if apps_to_start:
             print(f"\nApplications to DEPLOY and START ({len(apps_to_start)}):")
@@ -1596,10 +1622,14 @@ class StriimUpgradeManager:
                 flows = plan.get('flows', {})
                 strategy = app_plan.get('strategy', 'ON_ONE')
                 group = app_plan.get('deploymentGroup', 'default')
+                # Extract namespace for flow names
+                app_parts = app_name.split('.')
+                namespace = '.'.join(app_parts[:-1]) if len(app_parts) > 1 else ''
                 print(f"  - {app_name} ({strategy} in {group})")
                 if flows:
                     for flow_name, flow_plan in flows.items():
-                        print(f"      WITH {flow_name} ({flow_plan['strategy']} in {flow_plan['deploymentGroup']})")
+                        qualified_flow_name = f"{namespace}.{flow_name}" if namespace else flow_name
+                        print(f"      WITH {qualified_flow_name} ({flow_plan['strategy']} in {flow_plan['deploymentGroup']})")
 
         if not apps_to_deploy and not apps_to_start:
             print("\n[INFO] All applications are already in CREATED state, no action needed")
@@ -1618,6 +1648,10 @@ class StriimUpgradeManager:
             strategy = app_plan.get('strategy', 'ON_ONE')
             group = app_plan.get('deploymentGroup', 'default')
 
+            # Extract namespace from app_name (e.g., "DATALAKE.myapp" -> "DATALAKE")
+            app_parts = app_name.split('.')
+            namespace = '.'.join(app_parts[:-1]) if len(app_parts) > 1 else ''
+
             # Convert strategy to command format (ON_ONE -> ONE, ON_ALL -> ALL)
             deploy_mode = strategy.replace('ON_', '')
 
@@ -1625,12 +1659,14 @@ class StriimUpgradeManager:
             deploy_cmd = f"DEPLOY APPLICATION {app_name} ON {deploy_mode} IN {group}"
 
             if flows:
-                # Add WITH clause for each flow
+                # Add WITH clause for each flow (with namespace prefix)
                 with_clauses = []
                 for flow_name, flow_plan in flows.items():
                     flow_strategy = flow_plan['strategy'].replace('ON_', '')
                     flow_group = flow_plan['deploymentGroup']
-                    with_clauses.append(f"{flow_name} ON {flow_strategy} IN {flow_group}")
+                    # Prepend namespace to flow name if namespace exists
+                    qualified_flow_name = f"{namespace}.{flow_name}" if namespace else flow_name
+                    with_clauses.append(f"{qualified_flow_name} ON {flow_strategy} IN {flow_group}")
                 deploy_cmd += " WITH " + ", ".join(with_clauses)
 
             deploy_cmd += ";"
@@ -1639,7 +1675,8 @@ class StriimUpgradeManager:
             if flows:
                 print(f"  App: {deploy_mode} in {group}")
                 for flow_name, flow_plan in flows.items():
-                    print(f"  {flow_name}: {flow_plan['strategy'].replace('ON_', '')} in {flow_plan['deploymentGroup']}")
+                    qualified_flow_name = f"{namespace}.{flow_name}" if namespace else flow_name
+                    print(f"  {qualified_flow_name}: {flow_plan['strategy'].replace('ON_', '')} in {flow_plan['deploymentGroup']}")
             else:
                 print(f"  {deploy_mode} in {group}")
 
@@ -1658,6 +1695,10 @@ class StriimUpgradeManager:
             strategy = app_plan.get('strategy', 'ON_ONE')
             group = app_plan.get('deploymentGroup', 'default')
 
+            # Extract namespace from app_name (e.g., "DATALAKE.myapp" -> "DATALAKE")
+            app_parts = app_name.split('.')
+            namespace = '.'.join(app_parts[:-1]) if len(app_parts) > 1 else ''
+
             # Convert strategy to command format (ON_ONE -> ONE, ON_ALL -> ALL)
             deploy_mode = strategy.replace('ON_', '')
 
@@ -1665,12 +1706,14 @@ class StriimUpgradeManager:
             deploy_cmd = f"DEPLOY APPLICATION {app_name} ON {deploy_mode} IN {group}"
 
             if flows:
-                # Add WITH clause for each flow
+                # Add WITH clause for each flow (with namespace prefix)
                 with_clauses = []
                 for flow_name, flow_plan in flows.items():
                     flow_strategy = flow_plan['strategy'].replace('ON_', '')
                     flow_group = flow_plan['deploymentGroup']
-                    with_clauses.append(f"{flow_name} ON {flow_strategy} IN {flow_group}")
+                    # Prepend namespace to flow name if namespace exists
+                    qualified_flow_name = f"{namespace}.{flow_name}" if namespace else flow_name
+                    with_clauses.append(f"{qualified_flow_name} ON {flow_strategy} IN {flow_group}")
                 deploy_cmd += " WITH " + ", ".join(with_clauses)
 
             deploy_cmd += ";"
@@ -1679,7 +1722,8 @@ class StriimUpgradeManager:
             if flows:
                 print(f"  App: {deploy_mode} in {group}")
                 for flow_name, flow_plan in flows.items():
-                    print(f"  {flow_name}: {flow_plan['strategy'].replace('ON_', '')} in {flow_plan['deploymentGroup']}")
+                    qualified_flow_name = f"{namespace}.{flow_name}" if namespace else flow_name
+                    print(f"  {qualified_flow_name}: {flow_plan['strategy'].replace('ON_', '')} in {flow_plan['deploymentGroup']}")
             else:
                 print(f"  {deploy_mode} in {group}")
 
