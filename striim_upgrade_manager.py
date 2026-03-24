@@ -47,6 +47,7 @@ import sys
 import os
 import zipfile
 import tempfile
+import logging
 from typing import Dict, Optional, List, Tuple, Set
 from pathlib import Path
 from datetime import datetime
@@ -57,6 +58,47 @@ urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
 STATE_FILE = "upgrade_state.json"
 BACKUP_DIR = "upgrade_backup"
+LOG_DIR = "upgrade_logs"
+
+logger = logging.getLogger("striim_upgrade_manager")
+
+
+def setup_logging(log_dir: str = LOG_DIR, verbose: bool = False):
+    """Setup logging with both console and file output.
+
+    Console shows INFO+ (or DEBUG+ if verbose).
+    File always captures DEBUG level with timestamps for full audit trail.
+    Log files are timestamped so multiple runs are preserved.
+    """
+    log_level = logging.DEBUG if verbose else logging.INFO
+    log_format = '%(asctime)s [%(levelname)s] %(message)s'
+    date_format = '%Y-%m-%d %H:%M:%S'
+
+    # Console handler - same output as before (replaces print)
+    console_handler = logging.StreamHandler(sys.stdout)
+    console_handler.setLevel(log_level)
+    console_handler.setFormatter(logging.Formatter(log_format, date_format))
+
+    handlers = [console_handler]
+
+    # File handler - always DEBUG, timestamped filename
+    os.makedirs(log_dir, exist_ok=True)
+    timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
+    log_file = os.path.join(log_dir, f"upgrade_manager_{timestamp}.log")
+    file_handler = logging.FileHandler(log_file)
+    file_handler.setLevel(logging.DEBUG)
+    file_handler.setFormatter(logging.Formatter(log_format, date_format))
+    handlers.append(file_handler)
+
+    # Configure root logger
+    logging.basicConfig(
+        level=logging.DEBUG,
+        format=log_format,
+        datefmt=date_format,
+        handlers=handlers
+    )
+
+    logger.info(f"Logging to file: {log_file}")
 
 
 class UpgradeState:
@@ -85,7 +127,7 @@ class UpgradeState:
         self.state['timestamp'] = datetime.now().isoformat()
         with open(self.state_file, 'w') as f:
             json.dump(self.state, f, indent=2)
-        print(f"[OK] State saved to {self.state_file}")
+        logger.info(f"[OK] State saved to {self.state_file}")
 
     def set_phase(self, phase: str):
         self.state['phase'] = phase
@@ -142,16 +184,16 @@ class StriimAPI:
             self.token = result.get("token")
 
             if self.token:
-                print(f"[OK] Authenticated as {self.username}")
+                logger.info(f"[OK] Authenticated as {self.username}")
                 return True
             return False
         except Exception as e:
-            print(f"[ERROR] Authentication failed: {e}")
+            logger.error(f"[ERROR] Authentication failed: {e}")
             return False
 
     def execute_command(self, command: str) -> Optional[Dict]:
         if not self.token:
-            print("[ERROR] Not authenticated")
+            logger.error("[ERROR] Not authenticated")
             return None
 
         api_url = f"{self.base_url}/api/v2/tungsten"
@@ -165,7 +207,7 @@ class StriimAPI:
             response.raise_for_status()
             return response.json()
         except Exception as e:
-            print(f"[ERROR] Command failed: {e}")
+            logger.error(f"[ERROR] Command failed: {e}")
             # Try to get more details from the response
             try:
                 error_detail = response.json()
@@ -174,9 +216,9 @@ class StriimAPI:
                         if cmd_result.get('executionStatus') == 'Failure':
                             failure_msg = cmd_result.get('failureMessage', '')
                             cmd_text = cmd_result.get('command', '')[:100]
-                            print(f"[ERROR] Failed command: {cmd_text}...")
+                            logger.error(f"[ERROR] Failed command: {cmd_text}...")
                             if failure_msg:
-                                print(f"[ERROR] Details: {failure_msg}")
+                                logger.error(f"[ERROR] Details: {failure_msg}")
             except:
                 pass
             return None
@@ -184,7 +226,7 @@ class StriimAPI:
     def export_all_applications(self, export_path: str, passphrase: str) -> bool:
         """Export all applications to a zip file using EXPORT APPLICATION ALL"""
         if not self.token:
-            print("[ERROR] Not authenticated")
+            logger.error("[ERROR] Not authenticated")
             return False
 
         api_url = f"{self.base_url}/api/v2/tungsten"
@@ -206,7 +248,7 @@ class StriimAPI:
             return True
 
         except Exception as e:
-            print(f"[ERROR] Export failed: {e}")
+            logger.error(f"[ERROR] Export failed: {e}")
             return False
 
 
@@ -220,7 +262,7 @@ class StriimUpgradeManager:
 
     def analyze_from_files(self) -> Dict:
         """Analyze existing exported TQL files without re-exporting"""
-        print("\n=== Analyzing from Existing Files ===")
+        logger.info("\n=== Analyzing from Existing Files ===")
 
         # Check for extracted directory first, then fall back to zip
         extracted_dir = os.path.join(BACKUP_DIR, "all_applications")
@@ -231,26 +273,26 @@ class StriimUpgradeManager:
             # Count TQL files in directory
             tql_files = [f for f in os.listdir(extracted_dir) if f.endswith('.tql')]
             if tql_files:
-                print(f"[OK] Found extracted directory with {len(tql_files)} TQL files: {extracted_dir}")
+                logger.info(f"[OK] Found extracted directory with {len(tql_files)} TQL files: {extracted_dir}")
                 use_directory = True
             else:
-                print(f"[WARN] Directory exists but contains no TQL files: {extracted_dir}")
+                logger.warning(f"[WARN] Directory exists but contains no TQL files: {extracted_dir}")
 
         if not use_directory:
             if not os.path.exists(export_path):
-                print(f"[ERROR] Export file not found: {export_path}")
-                print("[INFO] Run --analyze first to export applications")
+                logger.error(f"[ERROR] Export file not found: {export_path}")
+                logger.info("[INFO] Run --analyze first to export applications")
                 return {}
-            print(f"[OK] Found existing export: {export_path}")
+            logger.info(f"[OK] Found existing export: {export_path}")
 
         # Get list of custom libraries from Striim
-        print("\nGetting list of custom libraries...")
+        logger.info("\nGetting list of custom libraries...")
         libraries_result = self.api.execute_command("LIST LIBRARIES;")
         custom_libraries = set()  # For backward compatibility (base names)
         library_files = {}  # Map base_name -> full filename
 
         if not libraries_result:
-            print("[WARN] Failed to get libraries list")
+            logger.warning("[WARN] Failed to get libraries list")
         else:
             if isinstance(libraries_result, list) and len(libraries_result) > 0:
                 output = libraries_result[0].get('output', [])
@@ -261,12 +303,12 @@ class StriimUpgradeManager:
                         base_name = filename.split('-')[0].split('.')[0]
                         custom_libraries.add(base_name)
                         library_files[base_name] = filename
-            print(f"[OK] Found {len(custom_libraries)} custom libraries:")
+            logger.info(f"[OK] Found {len(custom_libraries)} custom libraries:")
             for base_name, filename in sorted(library_files.items()):
-                print(f"     - {base_name}: {filename}")
+                logger.info(f"     - {base_name}: {filename}")
 
         # Get application states from Striim
-        print("\nGetting application states...")
+        logger.info("\nGetting application states...")
         result = self.api.execute_command("mon;")
         app_states = {}
         if result and isinstance(result, list) and len(result) > 0:
@@ -277,15 +319,15 @@ class StriimUpgradeManager:
                 app_status = app.get('statusChange', 'UNKNOWN')
                 if app_name:
                     app_states[app_name] = app_status
-        print(f"[OK] Retrieved {len(app_states)} application(s)")
+        logger.info(f"[OK] Retrieved {len(app_states)} application(s)")
 
         # Get deployment plans for deployed/running apps
-        print("\nGetting deployment plans...")
+        logger.info("\nGetting deployment plans...")
         deployment_plans = self._get_deployment_plans(app_states)
-        print(f"[OK] Retrieved {len(deployment_plans)} deployment plan(s)")
+        logger.info(f"[OK] Retrieved {len(deployment_plans)} deployment plan(s)")
 
         # Analyze the existing export file or directory
-        print("\nAnalyzing TQL files...")
+        logger.info("\nAnalyzing TQL files...")
         passphrase = config.get_config().get('passphrase', 'striim123')
 
         if use_directory:
@@ -318,65 +360,65 @@ class StriimUpgradeManager:
         self.state.set_phase('analyzed')
 
         # Display summary
-        print(f"\n[OK] Analysis complete. Found components in {len(components_found)} applications")
+        logger.info(f"\n[OK] Analysis complete. Found components in {len(components_found)} applications")
         for app_name, comps in components_found.items():
-            print(f"  {app_name}: {len(comps)} component(s)")
+            logger.info(f"  {app_name}: {len(comps)} component(s)")
             for comp in comps:
-                print(f"    - {comp['type']}: {comp['name']}")
+                logger.info(f"    - {comp['type']}: {comp['name']}")
 
         # Display application states
-        print(f"\n[INFO] Application States:")
+        logger.info(f"\n[INFO] Application States:")
         for app_name, status in sorted(app_states.items()):
             marker = " *" if app_name in components_found else ""
-            print(f"  {app_name}: {status}{marker}")
+            logger.info(f"  {app_name}: {status}{marker}")
         if components_found:
-            print("\n  * = Contains custom components")
+            logger.info("\n  * = Contains custom components")
 
         return components_found
 
     def analyze(self) -> Dict:
         """Analyze all applications to find OPs and UDFs"""
         if self.dry_run:
-            print("\n=== [DRY-RUN] Analyzing Applications ===")
+            logger.info("\n=== [DRY-RUN] Analyzing Applications ===")
         else:
-            print("\n=== Analyzing Applications ===")
+            logger.info("\n=== Analyzing Applications ===")
 
         # Check if we have existing component data that would be overwritten
         if self.state.state['apps_with_components'] and not self.dry_run:
             num_apps = len(self.state.state['apps_with_components'])
             total_components = sum(len(comps) for comps in self.state.state['apps_with_components'].values())
 
-            print("\n" + "="*70)
-            print("⚠️  WARNING: EXISTING COMPONENT DATA WILL BE OVERWRITTEN!")
-            print("="*70)
-            print(f"Current state contains {total_components} component(s) across {num_apps} application(s):")
+            logger.warning("\n" + "="*70)
+            logger.warning("⚠️  WARNING: EXISTING COMPONENT DATA WILL BE OVERWRITTEN!")
+            logger.warning("="*70)
+            logger.warning(f"Current state contains {total_components} component(s) across {num_apps} application(s):")
             for app_name, components in self.state.state['apps_with_components'].items():
-                print(f"  • {app_name}: {len(components)} component(s)")
+                logger.warning(f"  • {app_name}: {len(components)} component(s)")
                 for comp in components:
-                    print(f"    - {comp['type']}: {comp['name']}")
-            print("\nRe-analyzing will:")
-            print("  1. Create a backup at: upgrade_state.json.backup")
-            print("  2. REPLACE all component data with current app state")
-            print("  3. If components were already removed, you will LOSE the CREATE statements!")
-            print("\nThis means you will NOT be able to restore these components unless you")
-            print("use the backup file!")
-            print("="*70)
+                    logger.warning(f"    - {comp['type']}: {comp['name']}")
+            logger.warning("\nRe-analyzing will:")
+            logger.warning("  1. Create a backup at: upgrade_state.json.backup")
+            logger.warning("  2. REPLACE all component data with current app state")
+            logger.warning("  3. If components were already removed, you will LOSE the CREATE statements!")
+            logger.warning("\nThis means you will NOT be able to restore these components unless you")
+            logger.warning("use the backup file!")
+            logger.warning("="*70)
 
             response = input("\nAre you sure you want to continue? (yes/no): ").strip().lower()
             if response not in ['yes', 'y']:
-                print("[CANCELLED] Analysis cancelled by user")
+                logger.info("[CANCELLED] Analysis cancelled by user")
                 return {}
 
             # Create backup
             backup_file = f"{self.state.state_file}.backup"
             import shutil
             shutil.copy(self.state.state_file, backup_file)
-            print(f"\n[OK] Backed up existing state to {backup_file}")
+            logger.info(f"\n[OK] Backed up existing state to {backup_file}")
 
         # Get all apps and their states using mon command
         result = self.api.execute_command("mon;")
         if not result:
-            print("[ERROR] Failed to get application list")
+            logger.error("[ERROR] Failed to get application list")
             return {}
 
         # Extract application states (RUNNING, CREATED, DEPLOYED, etc.)
@@ -390,32 +432,32 @@ class StriimUpgradeManager:
                 if app_name:
                     app_states[app_name] = app_status
 
-        print(f"[OK] Retrieved {len(app_states)} application(s)")
+        logger.info(f"[OK] Retrieved {len(app_states)} application(s)")
 
         # Get deployment plans for deployed/running apps
-        print("\nGetting deployment plans...")
+        logger.info("\nGetting deployment plans...")
         deployment_plans = self._get_deployment_plans(app_states)
-        print(f"[OK] Retrieved {len(deployment_plans)} deployment plan(s)")
+        logger.info(f"[OK] Retrieved {len(deployment_plans)} deployment plan(s)")
 
         # In dry-run mode, show states and exit early
         if self.dry_run:
-            print(f"\n[INFO] Application States:")
+            logger.info(f"\n[INFO] Application States:")
             for app_name, status in sorted(app_states.items()):
                 plan = deployment_plans.get(app_name, {})
                 strategy = plan.get('strategy', 'N/A')
                 group = plan.get('deploymentGroup', 'N/A')
-                print(f"  {app_name}: {status} (Deploy: {strategy} in {group})")
-            print("\n[DRY-RUN] Would export applications and analyze TQL for custom components")
+                logger.info(f"  {app_name}: {status} (Deploy: {strategy} in {group})")
+            logger.info("\n[DRY-RUN] Would export applications and analyze TQL for custom components")
             return {}
 
         # Get list of custom libraries
-        print("\nGetting list of custom libraries...")
+        logger.info("\nGetting list of custom libraries...")
         libraries_result = self.api.execute_command("LIST LIBRARIES;")
         custom_libraries = set()  # For backward compatibility (base names)
         library_files = {}  # Map base_name -> full filename
 
         if not libraries_result:
-            print("[WARN] Failed to get libraries list")
+            logger.warning("[WARN] Failed to get libraries list")
         else:
             if isinstance(libraries_result, list) and len(libraries_result) > 0:
                 output = libraries_result[0].get('output', [])
@@ -426,12 +468,12 @@ class StriimUpgradeManager:
                         base_name = filename.split('-')[0].split('.')[0]
                         custom_libraries.add(base_name)
                         library_files[base_name] = filename
-            print(f"[OK] Found {len(custom_libraries)} custom libraries:")
+            logger.info(f"[OK] Found {len(custom_libraries)} custom libraries:")
             for base_name, filename in sorted(library_files.items()):
-                print(f"     - {base_name}: {filename}")
+                logger.info(f"     - {base_name}: {filename}")
 
         # Export all to analyze TQL
-        print("\nExporting applications to analyze...")
+        logger.info("\nExporting applications to analyze...")
         passphrase = config.get_config().get('passphrase', 'striim123')
 
         # Create backup directory if it doesn't exist
@@ -439,10 +481,10 @@ class StriimUpgradeManager:
         export_path = os.path.join(BACKUP_DIR, "all_applications.zip")
 
         if not self.api.export_all_applications(export_path, passphrase):
-            print("[ERROR] Export failed")
+            logger.error("[ERROR] Export failed")
             return {}
 
-        print(f"[OK] Exported to {export_path}")
+        logger.info(f"[OK] Exported to {export_path}")
 
         # Extract and parse TQL files from zip
         components_found = self._analyze_zip_for_components(export_path, passphrase, custom_libraries)
@@ -471,20 +513,20 @@ class StriimUpgradeManager:
         self.state.set_phase('analyzed')
 
         # Display summary
-        print(f"\n[OK] Analysis complete. Found components in {len(components_found)} applications")
+        logger.info(f"\n[OK] Analysis complete. Found components in {len(components_found)} applications")
         for app_name, comps in components_found.items():
-            print(f"  {app_name}: {len(comps)} component(s)")
+            logger.info(f"  {app_name}: {len(comps)} component(s)")
             for comp in comps:
-                print(f"    - {comp['type']}: {comp['name']}")
+                logger.info(f"    - {comp['type']}: {comp['name']}")
 
         # Display application states
-        print(f"\n[INFO] Application States:")
+        logger.info(f"\n[INFO] Application States:")
         for app_name, status in sorted(app_states.items()):
             # Highlight apps with custom components
             marker = " *" if app_name in components_found else ""
-            print(f"  {app_name}: {status}{marker}")
+            logger.info(f"  {app_name}: {status}{marker}")
         if components_found:
-            print("\n  * = Contains custom components")
+            logger.info("\n  * = Contains custom components")
 
         return components_found
 
@@ -497,15 +539,15 @@ class StriimUpgradeManager:
             tql_files = [f for f in os.listdir(directory_path) if f.endswith('.tql')]
 
             if not tql_files:
-                print("[WARN] No TQL files found in directory")
+                logger.warning("[WARN] No TQL files found in directory")
                 return {}
 
-            print(f"[OK] Found {len(tql_files)} TQL files in directory")
+            logger.info(f"[OK] Found {len(tql_files)} TQL files in directory")
 
             # Analyze each TQL file
             for i, tql_file in enumerate(tql_files, 1):
                 if i % 50 == 0:
-                    print(f"  Processed {i}/{len(tql_files)} files...")
+                    logger.info(f"  Processed {i}/{len(tql_files)} files...")
 
                 file_path = os.path.join(directory_path, tql_file)
                 with open(file_path, 'r', encoding='utf-8') as f:
@@ -521,7 +563,7 @@ class StriimUpgradeManager:
             return components
 
         except Exception as e:
-            print(f"[ERROR] Failed to analyze directory: {e}")
+            logger.error(f"[ERROR] Failed to analyze directory: {e}")
             import traceback
             traceback.print_exc()
             return {}
@@ -536,10 +578,10 @@ class StriimUpgradeManager:
                 tql_files = [f for f in zip_ref.namelist() if f.endswith('.tql')]
 
                 if not tql_files:
-                    print("[WARN] No TQL files found in export")
+                    logger.warning("[WARN] No TQL files found in export")
                     return {}
 
-                print(f"[OK] Found {len(tql_files)} TQL files in export")
+                logger.info(f"[OK] Found {len(tql_files)} TQL files in export")
 
                 # Analyze each TQL file
                 for tql_file in tql_files:
@@ -555,7 +597,7 @@ class StriimUpgradeManager:
                 return components
 
         except Exception as e:
-            print(f"[ERROR] Failed to analyze zip file: {e}")
+            logger.error(f"[ERROR] Failed to analyze zip file: {e}")
             return {}
 
     def _analyze_tql_for_components(self, tql_content: str, custom_libraries: set) -> Dict:
@@ -902,44 +944,44 @@ class StriimUpgradeManager:
 
     def remove_from_apps(self):
         """Remove OPs/UDFs from applications"""
-        print("\n=== Removing Components from Applications ===")
+        logger.info("\n=== Removing Components from Applications ===")
 
         if not self.state.state['apps_with_components']:
-            print("[WARN] No components found. Run --analyze first.")
+            logger.warning("[WARN] No components found. Run --analyze first.")
             return
 
         for app_name, components in self.state.state['apps_with_components'].items():
-            print(f"\nProcessing {app_name}...")
+            logger.info(f"\nProcessing {app_name}...")
 
             # Check app state - if RUNNING, need to STOP first, then UNDEPLOY
             app_state = self.state.state.get('app_states', {}).get(app_name, 'UNKNOWN')
 
             # Handle transitional states - these should not be processed
             if app_state in ['STARTING', 'STOPPING', 'DEPLOYING', 'UNDEPLOYING']:
-                print(f"  [ERROR] App {app_name} is in transitional state: {app_state}")
-                print(f"  [ERROR] Please wait for app to reach stable state before running upgrade")
+                logger.error(f"  [ERROR] App {app_name} is in transitional state: {app_state}")
+                logger.error(f"  [ERROR] Please wait for app to reach stable state before running upgrade")
                 continue
 
             if app_state == 'RUNNING':
                 if self.dry_run:
-                    print(f"  [DRY-RUN] Would stop {app_name} (currently RUNNING)")
+                    logger.info(f"  [DRY-RUN] Would stop {app_name} (currently RUNNING)")
                 else:
-                    print(f"  Stopping {app_name}...")
+                    logger.info(f"  Stopping {app_name}...")
                     self.api.execute_command(f"STOP APPLICATION {app_name};")
 
             # Undeploy app (whether it was RUNNING, DEPLOYED, HALTED, or TERMINATED)
             # HALTED and TERMINATED apps must also be undeployed before components can be removed
             if app_state in ['RUNNING', 'DEPLOYED', 'HALTED', 'TERMINATED']:
                 if self.dry_run:
-                    print(f"  [DRY-RUN] Would undeploy {app_name} (currently {app_state})")
+                    logger.info(f"  [DRY-RUN] Would undeploy {app_name} (currently {app_state})")
                 else:
-                    print(f"  Undeploying {app_name} (currently {app_state})...")
+                    logger.info(f"  Undeploying {app_name} (currently {app_state})...")
                     self.api.execute_command(f"UNDEPLOY APPLICATION {app_name};")
             elif app_state in ['UNKNOWN', 'NOT_FOUND']:
                 # App exists as TQL file but is not deployed in Striim
                 # We can still modify the TQL via ALTER commands
-                print(f"  [INFO] App {app_name} is not currently deployed (state: {app_state})")
-                print(f"  [INFO] Will modify TQL file only (no UNDEPLOY needed)")
+                logger.info(f"  [INFO] App {app_name} is not currently deployed (state: {app_state})")
+                logger.info(f"  [INFO] Will modify TQL file only (no UNDEPLOY needed)")
 
             for comp in components:
                 comp_name = comp['name']
@@ -949,12 +991,12 @@ class StriimUpgradeManager:
 
                 if self.dry_run:
                     flow_info = f" (in FLOW {flow_name})" if flow_name else ""
-                    print(f"  [DRY-RUN] Would remove {comp_type} {comp_name}{flow_info}")
+                    logger.info(f"  [DRY-RUN] Would remove {comp_type} {comp_name}{flow_info}")
                     continue
 
                 # Send ALTER, DROP, RECOMPILE as a single batch command
                 flow_info = f" from FLOW {flow_name}" if flow_name else ""
-                print(f"  Removing {comp_type} {comp_name}{flow_info}...")
+                logger.info(f"  Removing {comp_type} {comp_name}{flow_info}...")
 
                 # DROP command needs the component type (SOURCE or OPEN PROCESSOR)
                 drop_cmd = f"DROP {component_type} {comp_name};"
@@ -966,22 +1008,22 @@ class StriimUpgradeManager:
                     batch_cmd = f"ALTER APPLICATION {app_name};\n{drop_cmd}\nALTER APPLICATION {app_name} RECOMPILE;"
 
                 # Print the batch command for debugging
-                print(f"    [CMD] Executing batch command:")
+                logger.debug(f"    [CMD] Executing batch command:")
                 for line in batch_cmd.split('\n'):
-                    print(f"          {line}")
+                    logger.debug(f"          {line}")
 
                 result = self.api.execute_command(batch_cmd)
 
                 if result and isinstance(result, list) and len(result) > 0 and result[0].get('failureMessage'):
-                    print(f"    [ERROR] {result[0]['failureMessage']}")
-                    print(f"  [ERROR] Failed to remove {comp_name}")
+                    logger.error(f"    [ERROR] {result[0]['failureMessage']}")
+                    logger.error(f"  [ERROR] Failed to remove {comp_name}")
                 else:
                     self.state.state['removed_components'].setdefault(app_name, []).append(comp_name)
-                    print(f"  [OK] Removed {comp_name}")
+                    logger.info(f"  [OK] Removed {comp_name}")
 
         if not self.dry_run:
             self.state.set_phase('components_removed')
-        print("\n[OK] All components removed from applications")
+        logger.info("\n[OK] All components removed from applications")
 
     def unload_components(self):
         """Unload OPs/UDFs from Striim
@@ -993,17 +1035,17 @@ class StriimUpgradeManager:
             UNLOAD 'UploadedFiles/AdvFormat-5.0.2.jar';
             UNLOAD OPEN PROCESSOR 'UploadedFiles/EventChanger-5.0.2.jar';
         """
-        print("\n=== Unloading Components from Striim ===")
+        logger.info("\n=== Unloading Components from Striim ===")
 
         # Get library files from state (from LIST LIBRARIES)
         library_files = self.state.state.get('library_files', {})
         if not library_files:
-            print("[ERROR] No library files found in state. Run --analyze first.")
+            logger.error("[ERROR] No library files found in state. Run --analyze first.")
             return
 
-        print(f"\n[INFO] Unloading ALL libraries from LIST LIBRARIES ({len(library_files)}):")
+        logger.info(f"\n[INFO] Unloading ALL libraries from LIST LIBRARIES ({len(library_files)}):")
         for base_name, filename in sorted(library_files.items()):
-            print(f"  - {base_name}: {filename}")
+            logger.info(f"  - {base_name}: {filename}")
 
         # Unload each library
         # Try UNLOAD first (for UDFs), then UNLOAD OPEN PROCESSOR (for OPs)
@@ -1014,10 +1056,10 @@ class StriimUpgradeManager:
             file_path = f"UploadedFiles/{filename}"
 
             if self.dry_run:
-                print(f"\n  [DRY-RUN] Would unload '{file_path}'")
+                logger.info(f"\n  [DRY-RUN] Would unload '{file_path}'")
                 continue
 
-            print(f"\n  Unloading '{file_path}'...")
+            logger.info(f"\n  Unloading '{file_path}'...")
 
             # Try UNLOAD first (for UDFs)
             unload_cmd = f"UNLOAD '{file_path}';"
@@ -1025,27 +1067,27 @@ class StriimUpgradeManager:
 
             if result and not (isinstance(result, list) and len(result) > 0 and result[0].get('failureMessage')):
                 self.state.state['unloaded_components'].append(file_path)
-                print(f"    [OK] Unloaded {filename} (UDF)")
+                logger.info(f"    [OK] Unloaded {filename} (UDF)")
                 unloaded_count += 1
             else:
                 # Try UNLOAD OPEN PROCESSOR (for OPs)
-                print(f"    Trying as Open Processor...")
+                logger.info(f"    Trying as Open Processor...")
                 unload_cmd = f"UNLOAD OPEN PROCESSOR '{file_path}';"
                 result = self.api.execute_command(unload_cmd)
 
                 if result and not (isinstance(result, list) and len(result) > 0 and result[0].get('failureMessage')):
                     self.state.state['unloaded_components'].append(file_path)
-                    print(f"    [OK] Unloaded {filename} (OP)")
+                    logger.info(f"    [OK] Unloaded {filename} (OP)")
                     unloaded_count += 1
                 else:
                     error_msg = result[0].get('failureMessage', 'Unknown error') if isinstance(result, list) and len(result) > 0 else 'Unknown error'
-                    print(f"    [ERROR] Failed to unload {filename}: {error_msg}")
+                    logger.error(f"    [ERROR] Failed to unload {filename}: {error_msg}")
                     failed_count += 1
 
         if not self.dry_run:
             self.state.set_phase('components_unloaded')
 
-        print(f"\n[OK] Unload complete: {unloaded_count} succeeded, {failed_count} failed (total: {len(library_files)})")
+        logger.info(f"\n[OK] Unload complete: {unloaded_count} succeeded, {failed_count} failed (total: {len(library_files)})")
 
     def load_components(self, component_path: str = None):
         """Load new OPs/UDFs after upgrade
@@ -1053,14 +1095,14 @@ class StriimUpgradeManager:
         Can load multiple files from UploadedFiles/ directory.
         For each file, tries LOAD first (for UDFs), then LOAD OPEN PROCESSOR (for OPs).
         """
-        print("\n=== Loading Components ===")
+        logger.info("\n=== Loading Components ===")
 
         if component_path:
             # Manual mode - load specific file(s)
             # Support comma-separated list of files
             files_to_load = [f.strip() for f in component_path.split(',')]
 
-            print(f"\n[INFO] Loading {len(files_to_load)} file(s)...")
+            logger.info(f"\n[INFO] Loading {len(files_to_load)} file(s)...")
             loaded_count = 0
             failed_count = 0
 
@@ -1070,10 +1112,10 @@ class StriimUpgradeManager:
                     file_path = f"UploadedFiles/{file_path}"
 
                 if self.dry_run:
-                    print(f"\n  [DRY-RUN] Would load {file_path}")
+                    logger.info(f"\n  [DRY-RUN] Would load {file_path}")
                     continue
 
-                print(f"\n  Loading '{file_path}'...")
+                logger.info(f"\n  Loading '{file_path}'...")
 
                 # Try LOAD first (for UDFs)
                 load_cmd = f"LOAD '{file_path}';"
@@ -1081,26 +1123,26 @@ class StriimUpgradeManager:
 
                 if result and not (isinstance(result, list) and len(result) > 0 and result[0].get('failureMessage')):
                     self.state.state['loaded_components'].append(file_path)
-                    print(f"    [OK] Loaded {file_path} (UDF)")
+                    logger.info(f"    [OK] Loaded {file_path} (UDF)")
                     loaded_count += 1
                 else:
                     # Try LOAD OPEN PROCESSOR (for OPs)
-                    print(f"    Trying as Open Processor...")
+                    logger.info(f"    Trying as Open Processor...")
                     load_cmd = f"LOAD OPEN PROCESSOR '{file_path}';"
                     result = self.api.execute_command(load_cmd)
 
                     if result and not (isinstance(result, list) and len(result) > 0 and result[0].get('failureMessage')):
                         self.state.state['loaded_components'].append(file_path)
-                        print(f"    [OK] Loaded {file_path} (OP)")
+                        logger.info(f"    [OK] Loaded {file_path} (OP)")
                         loaded_count += 1
                     else:
                         error_msg = result[0].get('failureMessage', 'Unknown error') if isinstance(result, list) and len(result) > 0 else 'Unknown error'
-                        print(f"    [ERROR] Failed to load {file_path}: {error_msg}")
+                        logger.error(f"    [ERROR] Failed to load {file_path}: {error_msg}")
                         failed_count += 1
 
             if not self.dry_run:
                 self.state.save()
-                print(f"\n[OK] Load complete: {loaded_count} succeeded, {failed_count} failed (total: {len(files_to_load)})")
+                logger.info(f"\n[OK] Load complete: {loaded_count} succeeded, {failed_count} failed (total: {len(files_to_load)})")
         else:
             # Interactive mode - map old components to new versions
             self._interactive_component_loading()
@@ -1109,32 +1151,32 @@ class StriimUpgradeManager:
         """Interactive mode to map old component versions to new ones"""
         # Get list of components that were unloaded
         if not self.state.state.get('unloaded_components'):
-            print("[WARN] No components were unloaded. Nothing to load.")
-            print("[INFO] If you want to load a specific component, use:")
-            print("       --load-components --component-path UploadedFiles/YourComponent.jar")
+            logger.warning("[WARN] No components were unloaded. Nothing to load.")
+            logger.info("[INFO] If you want to load a specific component, use:")
+            logger.info("       --load-components --component-path UploadedFiles/YourComponent.jar")
             return
 
         unloaded = self.state.state['unloaded_components']
-        print(f"\n[INFO] Found {len(unloaded)} component(s) that were unloaded:")
+        logger.info(f"\n[INFO] Found {len(unloaded)} component(s) that were unloaded:")
         for comp in unloaded:
-            print(f"  - {comp}")
+            logger.info(f"  - {comp}")
 
         # Get list of available files in UploadedFiles/
-        print("\n[INFO] Fetching available files from UploadedFiles/...")
+        logger.info("\n[INFO] Fetching available files from UploadedFiles/...")
         available_files = self._get_uploaded_files()
 
         if not available_files:
-            print("[ERROR] No files found in UploadedFiles/")
-            print("[INFO] Please upload your new component files via Striim UI first")
+            logger.error("[ERROR] No files found in UploadedFiles/")
+            logger.info("[INFO] Please upload your new component files via Striim UI first")
             return
 
-        print(f"[OK] Found {len(available_files)} file(s) in UploadedFiles/:")
+        logger.info(f"[OK] Found {len(available_files)} file(s) in UploadedFiles/:")
         for f in available_files:
-            print(f"  - {f}")
+            logger.info(f"  - {f}")
 
         # Build mapping with auto-suggestions
-        print("\n=== Component Mapping ===")
-        print("Mapping old components to new versions...\n")
+        logger.info("\n=== Component Mapping ===")
+        logger.info("Mapping old components to new versions...\n")
 
         component_mapping = {}
         for old_comp in unloaded:
@@ -1147,8 +1189,8 @@ class StriimUpgradeManager:
             if len(matches) == 1:
                 # Auto-match if only one candidate
                 suggested = matches[0]
-                print(f"Old: {old_comp}")
-                print(f"New: {suggested} (auto-matched)")
+                logger.info(f"Old: {old_comp}")
+                logger.info(f"New: {suggested} (auto-matched)")
 
                 if not self.dry_run:
                     confirm = input("Accept this mapping? (yes/no/manual): ").strip().lower()
@@ -1157,58 +1199,58 @@ class StriimUpgradeManager:
                     elif confirm == 'manual' or confirm == 'm':
                         component_mapping[old_comp] = self._manual_file_selection(old_comp, available_files)
                     else:
-                        print(f"  [SKIP] Skipping {old_comp}")
+                        logger.info(f"  [SKIP] Skipping {old_comp}")
                 else:
                     component_mapping[old_comp] = f"UploadedFiles/{suggested}"
 
             elif len(matches) > 1:
                 # Multiple matches - let user choose
-                print(f"Old: {old_comp}")
-                print(f"Found {len(matches)} possible matches:")
+                logger.info(f"Old: {old_comp}")
+                logger.info(f"Found {len(matches)} possible matches:")
                 for i, match in enumerate(matches, 1):
-                    print(f"  {i}. {match}")
+                    logger.info(f"  {i}. {match}")
 
                 if not self.dry_run:
                     choice = input(f"Select 1-{len(matches)} or 's' to skip: ").strip()
                     if choice.lower() == 's':
-                        print(f"  [SKIP] Skipping {old_comp}")
+                        logger.info(f"  [SKIP] Skipping {old_comp}")
                     elif choice.isdigit() and 1 <= int(choice) <= len(matches):
                         selected = matches[int(choice) - 1]
                         component_mapping[old_comp] = f"UploadedFiles/{selected}"
-                        print(f"  [OK] Mapped to {selected}")
+                        logger.info(f"  [OK] Mapped to {selected}")
                     else:
-                        print(f"  [SKIP] Invalid choice, skipping {old_comp}")
+                        logger.info(f"  [SKIP] Invalid choice, skipping {old_comp}")
                 else:
                     # In dry-run, use first match
                     component_mapping[old_comp] = f"UploadedFiles/{matches[0]}"
             else:
                 # No auto-match found
-                print(f"Old: {old_comp}")
-                print(f"No automatic match found for base name '{base_name}'")
+                logger.info(f"Old: {old_comp}")
+                logger.info(f"No automatic match found for base name '{base_name}'")
 
                 if not self.dry_run:
                     component_mapping[old_comp] = self._manual_file_selection(old_comp, available_files)
                 else:
-                    print(f"  [SKIP] Would prompt for manual selection")
+                    logger.info(f"  [SKIP] Would prompt for manual selection")
 
-            print()  # Blank line between components
+            logger.info("")  # Blank line between components
 
         # Show final mapping
         if component_mapping:
-            print("\n=== Final Component Mapping ===")
+            logger.info("\n=== Final Component Mapping ===")
             for old, new in component_mapping.items():
-                print(f"  {old} -> {new}")
+                logger.info(f"  {old} -> {new}")
 
             # Load all components
             if self.dry_run:
-                print("\n[DRY-RUN] Would load the above components")
+                logger.info("\n[DRY-RUN] Would load the above components")
             else:
-                print("\n[INFO] Loading components...")
+                logger.info("\n[INFO] Loading components...")
                 loaded_count = 0
                 failed_count = 0
 
                 for old_comp, new_path in component_mapping.items():
-                    print(f"\nLoading {new_path}...")
+                    logger.info(f"\nLoading {new_path}...")
 
                     # Try LOAD first (for UDFs)
                     load_cmd = f"LOAD '{new_path}';"
@@ -1216,27 +1258,27 @@ class StriimUpgradeManager:
 
                     if result and not (isinstance(result, list) and len(result) > 0 and result[0].get('failureMessage')):
                         self.state.state['loaded_components'].append(new_path)
-                        print(f"  [OK] Loaded {new_path} (UDF)")
+                        logger.info(f"  [OK] Loaded {new_path} (UDF)")
                         loaded_count += 1
                     else:
                         # Try LOAD OPEN PROCESSOR (for OPs)
-                        print(f"  Trying as Open Processor...")
+                        logger.info(f"  Trying as Open Processor...")
                         load_cmd = f"LOAD OPEN PROCESSOR '{new_path}';"
                         result = self.api.execute_command(load_cmd)
 
                         if result and not (isinstance(result, list) and len(result) > 0 and result[0].get('failureMessage')):
                             self.state.state['loaded_components'].append(new_path)
-                            print(f"  [OK] Loaded {new_path} (OP)")
+                            logger.info(f"  [OK] Loaded {new_path} (OP)")
                             loaded_count += 1
                         else:
                             error_msg = result[0].get('failureMessage', 'Unknown error') if isinstance(result, list) and len(result) > 0 else 'Unknown error'
-                            print(f"  [ERROR] Failed to load {new_path}: {error_msg}")
+                            logger.error(f"  [ERROR] Failed to load {new_path}: {error_msg}")
                             failed_count += 1
 
                 self.state.save()
-                print(f"\n[OK] Component loading complete: {loaded_count} succeeded, {failed_count} failed")
+                logger.info(f"\n[OK] Component loading complete: {loaded_count} succeeded, {failed_count} failed")
         else:
-            print("[WARN] No components were mapped")
+            logger.warning("[WARN] No components were mapped")
 
     def _extract_base_name(self, filename: str) -> str:
         """Extract base name from versioned filename
@@ -1273,20 +1315,20 @@ class StriimUpgradeManager:
 
     def _manual_file_selection(self, old_comp: str, available_files: List[str]) -> Optional[str]:
         """Let user manually select a file from the list"""
-        print(f"Available files:")
+        logger.info(f"Available files:")
         for i, f in enumerate(available_files, 1):
-            print(f"  {i}. {f}")
+            logger.info(f"  {i}. {f}")
 
         choice = input(f"Select 1-{len(available_files)} or 's' to skip: ").strip()
         if choice.lower() == 's':
-            print(f"  [SKIP] Skipping {old_comp}")
+            logger.info(f"  [SKIP] Skipping {old_comp}")
             return None
         elif choice.isdigit() and 1 <= int(choice) <= len(available_files):
             selected = available_files[int(choice) - 1]
-            print(f"  [OK] Mapped to {selected}")
+            logger.info(f"  [OK] Mapped to {selected}")
             return f"UploadedFiles/{selected}"
         else:
-            print(f"  [SKIP] Invalid choice, skipping {old_comp}")
+            logger.info(f"  [SKIP] Invalid choice, skipping {old_comp}")
             return None
 
     def _make_create_or_replace(self, create_stmt: str) -> str:
@@ -1317,29 +1359,29 @@ class StriimUpgradeManager:
           END FLOW <flow2>;
           ALTER APPLICATION <name> RECOMPILE;
         """
-        print("\n=== Restoring Components to Applications ===")
+        logger.info("\n=== Restoring Components to Applications ===")
 
         if not self.state.state['apps_with_components']:
-            print("[WARN] No components to restore. Run --analyze first.")
+            logger.warning("[WARN] No components to restore. Run --analyze first.")
             return
 
         for app_name, components in self.state.state['apps_with_components'].items():
-            print(f"\nProcessing {app_name}...")
+            logger.info(f"\nProcessing {app_name}...")
 
             # Check if app is deployed/running - if so, need to undeploy first
             app_state = self.state.state.get('app_states', {}).get(app_name, 'UNKNOWN')
 
             if app_state in ['RUNNING', 'DEPLOYED']:
                 if self.dry_run:
-                    print(f"  [DRY-RUN] Would undeploy {app_name} (currently {app_state})")
+                    logger.info(f"  [DRY-RUN] Would undeploy {app_name} (currently {app_state})")
                 else:
                     # Stop if running
                     if app_state == 'RUNNING':
-                        print(f"  Stopping {app_name}...")
+                        logger.info(f"  Stopping {app_name}...")
                         self.api.execute_command(f"STOP APPLICATION {app_name};")
 
                     # Undeploy
-                    print(f"  Undeploying {app_name}...")
+                    logger.info(f"  Undeploying {app_name}...")
                     self.api.execute_command(f"UNDEPLOY APPLICATION {app_name};")
 
             # Group components by flow: None = app-level, flow_name = in that flow
@@ -1356,18 +1398,18 @@ class StriimUpgradeManager:
                     app_level_components.append(comp)
 
             # Display what will be restored
-            print(f"  Components to restore:")
+            logger.info(f"  Components to restore:")
             if app_level_components:
-                print(f"    App-level: {len(app_level_components)} component(s)")
+                logger.info(f"    App-level: {len(app_level_components)} component(s)")
                 for comp in app_level_components:
-                    print(f"      - {comp['type']}: {comp['name']}")
+                    logger.info(f"      - {comp['type']}: {comp['name']}")
             for flow_name, flow_comps in flow_components.items():
-                print(f"    Flow '{flow_name}': {len(flow_comps)} component(s)")
+                logger.info(f"    Flow '{flow_name}': {len(flow_comps)} component(s)")
                 for comp in flow_comps:
-                    print(f"      - {comp['type']}: {comp['name']}")
+                    logger.info(f"      - {comp['type']}: {comp['name']}")
 
             if self.dry_run:
-                print(f"  [DRY-RUN] Would restore all components in a single batch command")
+                logger.info(f"  [DRY-RUN] Would restore all components in a single batch command")
                 continue
 
             # Build single batch command for ALL components in this app
@@ -1395,45 +1437,45 @@ class StriimUpgradeManager:
             batch_cmd = "\n".join(batch_lines)
 
             # Print the batch command for debugging
-            print(f"  [CMD] Executing batch command:")
+            logger.debug(f"  [CMD] Executing batch command:")
             for line in batch_cmd.split('\n'):
-                print(f"        {line}")
+                logger.debug(f"        {line}")
 
             # Execute as single batch
             result = self.api.execute_command(batch_cmd)
 
             if result and isinstance(result, list) and len(result) > 0 and result[0].get('failureMessage'):
-                print(f"  [ERROR] {result[0]['failureMessage']}")
-                print(f"  [ERROR] Failed to restore components to {app_name}")
+                logger.error(f"  [ERROR] {result[0]['failureMessage']}")
+                logger.error(f"  [ERROR] Failed to restore components to {app_name}")
             else:
                 self.state.state['restored_apps'].append(app_name)
                 total_restored = len(app_level_components) + sum(len(fc) for fc in flow_components.values())
-                print(f"  [OK] Restored {total_restored} component(s) to {app_name}")
+                logger.info(f"  [OK] Restored {total_restored} component(s) to {app_name}")
 
         if not self.dry_run:
             self.state.set_phase('components_restored')
-        print("\n[OK] All components restored to applications")
+        logger.info("\n[OK] All components restored to applications")
 
         # Automatically restore app states (DEPLOY/START) after components are restored
-        print("\n" + "="*60)
-        print("DEPLOYMENT PHASE")
-        print("="*60)
-        print("\n[INFO] Now restoring application states (DEPLOY/START)...")
-        print("[INFO] This will deploy/start all apps that were previously RUNNING/DEPLOYED")
+        logger.info("\n" + "="*60)
+        logger.info("DEPLOYMENT PHASE")
+        logger.info("="*60)
+        logger.info("\n[INFO] Now restoring application states (DEPLOY/START)...")
+        logger.info("[INFO] This will deploy/start all apps that were previously RUNNING/DEPLOYED")
 
         # Call restore_all_app_states to handle deployment
         self.restore_all_app_states()
 
     def restore_app_states(self):
         """Restore applications to their original states (DEPLOYED/RUNNING) and deployment groups"""
-        print("\n=== Restoring Application States ===")
+        logger.info("\n=== Restoring Application States ===")
 
         if not self.state.state.get('app_states'):
-            print("[WARN] No application states found. Run --analyze first.")
+            logger.warning("[WARN] No application states found. Run --analyze first.")
             return
 
         if not self.state.state['apps_with_components']:
-            print("[WARN] No components were restored. Run --restore first.")
+            logger.warning("[WARN] No components were restored. Run --restore first.")
             return
 
         app_states = self.state.state['app_states']
@@ -1455,16 +1497,16 @@ class StriimUpgradeManager:
                 # HALTED/TERMINATED apps should be restored to DEPLOYED state
                 # (they were undeployed during component removal)
                 apps_to_deploy.append(app_name)
-                print(f"[INFO] {app_name} was {original_state}, will restore to DEPLOYED")
+                logger.info(f"[INFO] {app_name} was {original_state}, will restore to DEPLOYED")
             elif original_state == 'CREATED':
                 # Already in correct state, no action needed
                 pass
             else:
-                print(f"[WARN] Unknown state '{original_state}' for {app_name}, skipping")
+                logger.warning(f"[WARN] Unknown state '{original_state}' for {app_name}, skipping")
 
         # Display what will be done
         if apps_to_deploy:
-            print(f"\nApplications to DEPLOY ({len(apps_to_deploy)}):")
+            logger.info(f"\nApplications to DEPLOY ({len(apps_to_deploy)}):")
             for app_name in apps_to_deploy:
                 plan = deployment_plans.get(app_name, {})
                 app_plan = plan.get('application', {})
@@ -1474,14 +1516,14 @@ class StriimUpgradeManager:
                 # Extract namespace for flow names
                 app_parts = app_name.split('.')
                 namespace = '.'.join(app_parts[:-1]) if len(app_parts) > 1 else ''
-                print(f"  - {app_name} ({strategy} in {group})")
+                logger.info(f"  - {app_name} ({strategy} in {group})")
                 if flows:
                     for flow_name, flow_plan in flows.items():
                         qualified_flow_name = f"{namespace}.{flow_name}" if namespace else flow_name
-                        print(f"      WITH {qualified_flow_name} ({flow_plan['strategy']} in {flow_plan['deploymentGroup']})")
+                        logger.info(f"      WITH {qualified_flow_name} ({flow_plan['strategy']} in {flow_plan['deploymentGroup']})")
 
         if apps_to_start:
-            print(f"\nApplications to DEPLOY and START ({len(apps_to_start)}):")
+            logger.info(f"\nApplications to DEPLOY and START ({len(apps_to_start)}):")
             for app_name in apps_to_start:
                 plan = deployment_plans.get(app_name, {})
                 app_plan = plan.get('application', {})
@@ -1491,18 +1533,18 @@ class StriimUpgradeManager:
                 # Extract namespace for flow names
                 app_parts = app_name.split('.')
                 namespace = '.'.join(app_parts[:-1]) if len(app_parts) > 1 else ''
-                print(f"  - {app_name} ({strategy} in {group})")
+                logger.info(f"  - {app_name} ({strategy} in {group})")
                 if flows:
                     for flow_name, flow_plan in flows.items():
                         qualified_flow_name = f"{namespace}.{flow_name}" if namespace else flow_name
-                        print(f"      WITH {qualified_flow_name} ({flow_plan['strategy']} in {flow_plan['deploymentGroup']})")
+                        logger.info(f"      WITH {qualified_flow_name} ({flow_plan['strategy']} in {flow_plan['deploymentGroup']})")
 
         if not apps_to_deploy and not apps_to_start:
-            print("\n[INFO] All applications are already in CREATED state, no action needed")
+            logger.info("\n[INFO] All applications are already in CREATED state, no action needed")
             return
 
         if self.dry_run:
-            print("\n[DRY-RUN] Would restore application states with deployment plans")
+            logger.info("\n[DRY-RUN] Would restore application states with deployment plans")
             return
 
         # Deploy applications
@@ -1537,20 +1579,20 @@ class StriimUpgradeManager:
 
             deploy_cmd += ";"
 
-            print(f"\nDeploying {app_name}...")
+            logger.info(f"\nDeploying {app_name}...")
             if flows:
-                print(f"  App: {deploy_mode} in {group}")
+                logger.info(f"  App: {deploy_mode} in {group}")
                 for flow_name, flow_plan in flows.items():
                     qualified_flow_name = f"{namespace}.{flow_name}" if namespace else flow_name
-                    print(f"  {qualified_flow_name}: {flow_plan['strategy'].replace('ON_', '')} in {flow_plan['deploymentGroup']}")
+                    logger.info(f"  {qualified_flow_name}: {flow_plan['strategy'].replace('ON_', '')} in {flow_plan['deploymentGroup']}")
             else:
-                print(f"  {deploy_mode} in {group}")
+                logger.info(f"  {deploy_mode} in {group}")
 
             result = self.api.execute_command(deploy_cmd)
             if result:
-                print(f"  [OK] Deployed {app_name}")
+                logger.info(f"  [OK] Deployed {app_name}")
             else:
-                print(f"  [ERROR] Failed to deploy {app_name}")
+                logger.error(f"  [ERROR] Failed to deploy {app_name}")
 
         # Deploy and start applications
         for app_name in apps_to_start:
@@ -1584,31 +1626,31 @@ class StriimUpgradeManager:
 
             deploy_cmd += ";"
 
-            print(f"\nDeploying and starting {app_name}...")
+            logger.info(f"\nDeploying and starting {app_name}...")
             if flows:
-                print(f"  App: {deploy_mode} in {group}")
+                logger.info(f"  App: {deploy_mode} in {group}")
                 for flow_name, flow_plan in flows.items():
                     qualified_flow_name = f"{namespace}.{flow_name}" if namespace else flow_name
-                    print(f"  {qualified_flow_name}: {flow_plan['strategy'].replace('ON_', '')} in {flow_plan['deploymentGroup']}")
+                    logger.info(f"  {qualified_flow_name}: {flow_plan['strategy'].replace('ON_', '')} in {flow_plan['deploymentGroup']}")
             else:
-                print(f"  {deploy_mode} in {group}")
+                logger.info(f"  {deploy_mode} in {group}")
 
             # Deploy first
             result = self.api.execute_command(deploy_cmd)
             if not result:
-                print(f"  [ERROR] Failed to deploy {app_name}")
+                logger.error(f"  [ERROR] Failed to deploy {app_name}")
                 continue
-            print(f"  [OK] Deployed {app_name}")
+            logger.info(f"  [OK] Deployed {app_name}")
 
             # Then start
             result = self.api.execute_command(f"START APPLICATION {app_name};")
             if result:
-                print(f"  [OK] Started {app_name}")
+                logger.info(f"  [OK] Started {app_name}")
             else:
-                print(f"  [ERROR] Failed to start {app_name}")
+                logger.error(f"  [ERROR] Failed to start {app_name}")
 
         self.state.set_phase('states_restored')
-        print("\n[OK] Application states restored")
+        logger.info("\n[OK] Application states restored")
 
     def restore_all_app_states(self):
         """Restore ALL applications to their original states (DEPLOYED/RUNNING), not just those with components
@@ -1616,10 +1658,10 @@ class StriimUpgradeManager:
         This is useful when you want to restore the entire environment state after an upgrade,
         regardless of whether apps had custom components.
         """
-        print("\n=== Restoring ALL Application States ===")
+        logger.info("\n=== Restoring ALL Application States ===")
 
         if not self.state.state.get('app_states'):
-            print("[WARN] No application states found. Run --analyze first.")
+            logger.warning("[WARN] No application states found. Run --analyze first.")
             return
 
         app_states = self.state.state['app_states']
@@ -1637,16 +1679,16 @@ class StriimUpgradeManager:
             elif original_state in ['HALTED', 'TERMINATED']:
                 # HALTED/TERMINATED apps should be restored to DEPLOYED state
                 apps_to_deploy.append(app_name)
-                print(f"[INFO] {app_name} was {original_state}, will restore to DEPLOYED")
+                logger.info(f"[INFO] {app_name} was {original_state}, will restore to DEPLOYED")
             elif original_state == 'CREATED':
                 # Already in correct state, no action needed
                 pass
             else:
-                print(f"[WARN] Unknown state '{original_state}' for {app_name}, skipping")
+                logger.warning(f"[WARN] Unknown state '{original_state}' for {app_name}, skipping")
 
         # Display what will be done
         if apps_to_deploy:
-            print(f"\nApplications to DEPLOY ({len(apps_to_deploy)}):")
+            logger.info(f"\nApplications to DEPLOY ({len(apps_to_deploy)}):")
             for app_name in apps_to_deploy:
                 plan = deployment_plans.get(app_name, {})
                 app_plan = plan.get('application', {})
@@ -1656,14 +1698,14 @@ class StriimUpgradeManager:
                 # Extract namespace for flow names
                 app_parts = app_name.split('.')
                 namespace = '.'.join(app_parts[:-1]) if len(app_parts) > 1 else ''
-                print(f"  - {app_name} ({strategy} in {group})")
+                logger.info(f"  - {app_name} ({strategy} in {group})")
                 if flows:
                     for flow_name, flow_plan in flows.items():
                         qualified_flow_name = f"{namespace}.{flow_name}" if namespace else flow_name
-                        print(f"      WITH {qualified_flow_name} ({flow_plan['strategy']} in {flow_plan['deploymentGroup']})")
+                        logger.info(f"      WITH {qualified_flow_name} ({flow_plan['strategy']} in {flow_plan['deploymentGroup']})")
 
         if apps_to_start:
-            print(f"\nApplications to DEPLOY and START ({len(apps_to_start)}):")
+            logger.info(f"\nApplications to DEPLOY and START ({len(apps_to_start)}):")
             for app_name in apps_to_start:
                 plan = deployment_plans.get(app_name, {})
                 app_plan = plan.get('application', {})
@@ -1673,18 +1715,18 @@ class StriimUpgradeManager:
                 # Extract namespace for flow names
                 app_parts = app_name.split('.')
                 namespace = '.'.join(app_parts[:-1]) if len(app_parts) > 1 else ''
-                print(f"  - {app_name} ({strategy} in {group})")
+                logger.info(f"  - {app_name} ({strategy} in {group})")
                 if flows:
                     for flow_name, flow_plan in flows.items():
                         qualified_flow_name = f"{namespace}.{flow_name}" if namespace else flow_name
-                        print(f"      WITH {qualified_flow_name} ({flow_plan['strategy']} in {flow_plan['deploymentGroup']})")
+                        logger.info(f"      WITH {qualified_flow_name} ({flow_plan['strategy']} in {flow_plan['deploymentGroup']})")
 
         if not apps_to_deploy and not apps_to_start:
-            print("\n[INFO] All applications are already in CREATED state, no action needed")
+            logger.info("\n[INFO] All applications are already in CREATED state, no action needed")
             return
 
         if self.dry_run:
-            print("\n[DRY-RUN] Would restore application states with deployment plans")
+            logger.info("\n[DRY-RUN] Would restore application states with deployment plans")
             return
 
         # Deploy applications
@@ -1719,20 +1761,20 @@ class StriimUpgradeManager:
 
             deploy_cmd += ";"
 
-            print(f"\nDeploying {app_name}...")
+            logger.info(f"\nDeploying {app_name}...")
             if flows:
-                print(f"  App: {deploy_mode} in {group}")
+                logger.info(f"  App: {deploy_mode} in {group}")
                 for flow_name, flow_plan in flows.items():
                     qualified_flow_name = f"{namespace}.{flow_name}" if namespace else flow_name
-                    print(f"  {qualified_flow_name}: {flow_plan['strategy'].replace('ON_', '')} in {flow_plan['deploymentGroup']}")
+                    logger.info(f"  {qualified_flow_name}: {flow_plan['strategy'].replace('ON_', '')} in {flow_plan['deploymentGroup']}")
             else:
-                print(f"  {deploy_mode} in {group}")
+                logger.info(f"  {deploy_mode} in {group}")
 
             result = self.api.execute_command(deploy_cmd)
             if result:
-                print(f"  [OK] Deployed {app_name}")
+                logger.info(f"  [OK] Deployed {app_name}")
             else:
-                print(f"  [ERROR] Failed to deploy {app_name}")
+                logger.error(f"  [ERROR] Failed to deploy {app_name}")
 
         # Deploy and start applications
         for app_name in apps_to_start:
@@ -1766,59 +1808,59 @@ class StriimUpgradeManager:
 
             deploy_cmd += ";"
 
-            print(f"\nDeploying and starting {app_name}...")
+            logger.info(f"\nDeploying and starting {app_name}...")
             if flows:
-                print(f"  App: {deploy_mode} in {group}")
+                logger.info(f"  App: {deploy_mode} in {group}")
                 for flow_name, flow_plan in flows.items():
                     qualified_flow_name = f"{namespace}.{flow_name}" if namespace else flow_name
-                    print(f"  {qualified_flow_name}: {flow_plan['strategy'].replace('ON_', '')} in {flow_plan['deploymentGroup']}")
+                    logger.info(f"  {qualified_flow_name}: {flow_plan['strategy'].replace('ON_', '')} in {flow_plan['deploymentGroup']}")
             else:
-                print(f"  {deploy_mode} in {group}")
+                logger.info(f"  {deploy_mode} in {group}")
 
             # Deploy first
             result = self.api.execute_command(deploy_cmd)
             if not result:
-                print(f"  [ERROR] Failed to deploy {app_name}")
+                logger.error(f"  [ERROR] Failed to deploy {app_name}")
                 continue
-            print(f"  [OK] Deployed {app_name}")
+            logger.info(f"  [OK] Deployed {app_name}")
 
             # Then start
             result = self.api.execute_command(f"START APPLICATION {app_name};")
             if result:
-                print(f"  [OK] Started {app_name}")
+                logger.info(f"  [OK] Started {app_name}")
             else:
-                print(f"  [ERROR] Failed to start {app_name}")
+                logger.error(f"  [ERROR] Failed to start {app_name}")
 
         self.state.set_phase('all_states_restored')
-        print("\n[OK] All application states restored")
+        logger.info("\n[OK] All application states restored")
 
     def prepare_for_upgrade(self):
         """Run all pre-upgrade steps"""
-        print("\n" + "="*60)
-        print("PREPARE FOR UPGRADE - Running all pre-upgrade steps")
-        print("="*60)
+        logger.info("\n" + "="*60)
+        logger.info("PREPARE FOR UPGRADE - Running all pre-upgrade steps")
+        logger.info("="*60)
 
         self.analyze()
         self.remove_from_apps()
         self.unload_components()
 
-        print("\n" + "="*60)
-        print("PRE-UPGRADE COMPLETE")
-        print("="*60)
-        print("\nNext steps:")
-        print("1. Upgrade Striim to the new version")
-        print("2. Upload new OP/UDF files via UI")
-        print("3. Run: python striim_upgrade_manager.py --complete-upgrade")
+        logger.info("\n" + "="*60)
+        logger.info("PRE-UPGRADE COMPLETE")
+        logger.info("="*60)
+        logger.info("\nNext steps:")
+        logger.info("1. Upgrade Striim to the new version")
+        logger.info("2. Upload new OP/UDF files via UI")
+        logger.info("3. Run: python striim_upgrade_manager.py --complete-upgrade")
 
     def complete_upgrade(self):
         """Run all post-upgrade steps"""
-        print("\n" + "="*60)
-        print("COMPLETE UPGRADE - Running all post-upgrade steps")
-        print("="*60)
+        logger.info("\n" + "="*60)
+        logger.info("COMPLETE UPGRADE - Running all post-upgrade steps")
+        logger.info("="*60)
 
-        print("\n[INFO] Make sure you have uploaded the new component files!")
-        print("[INFO] Use --load-components --component-path <path> for each component")
-        print("\nThen run --restore-to-apps to add them back to applications")
+        logger.info("\n[INFO] Make sure you have uploaded the new component files!")
+        logger.info("[INFO] Use --load-components --component-path <path> for each component")
+        logger.info("\nThen run --restore-to-apps to add them back to applications")
 
 
 def main():
@@ -1897,20 +1939,23 @@ Examples:
 
     args = parser.parse_args()
 
+    # Initialize logging
+    setup_logging()
+
     # Handle status and reset without authentication
     if args.status:
         state = UpgradeState()
-        print("\n=== Upgrade State ===")
-        print(json.dumps(state.state, indent=2))
+        logger.info("\n=== Upgrade State ===")
+        logger.info(json.dumps(state.state, indent=2))
         return
 
     if args.reset_state:
         if os.path.exists(STATE_FILE):
             backup_name = f"{STATE_FILE}.backup.{datetime.now().strftime('%Y%m%d_%H%M%S')}"
             os.rename(STATE_FILE, backup_name)
-            print(f"[OK] State backed up to {backup_name}")
+            logger.info(f"[OK] State backed up to {backup_name}")
         else:
-            print("[INFO] No state file to reset")
+            logger.info("[INFO] No state file to reset")
         return
 
     # Initialize API and state
@@ -1918,7 +1963,7 @@ Examples:
     api = StriimAPI()
 
     if not api.authenticate():
-        print("[ERROR] Authentication failed. Check config.py settings.")
+        logger.error("[ERROR] Authentication failed. Check config.py settings.")
         sys.exit(1)
 
     manager = StriimUpgradeManager(api, state, args.dry_run)
@@ -1947,14 +1992,14 @@ Examples:
             manager.complete_upgrade()
         else:
             parser.print_help()
-            print("\n[INFO] No action specified. Use one of the action flags above.")
+            logger.info("\n[INFO] No action specified. Use one of the action flags above.")
     except KeyboardInterrupt:
-        print("\n\n[WARN] Interrupted by user")
+        logger.warning("\n\n[WARN] Interrupted by user")
         sys.exit(1)
     except Exception as e:
-        print(f"\n[ERROR] Unexpected error: {e}")
+        logger.error(f"\n[ERROR] Unexpected error: {e}")
         import traceback
-        traceback.print_exc()
+        logger.error(traceback.format_exc())
         sys.exit(1)
 
 
