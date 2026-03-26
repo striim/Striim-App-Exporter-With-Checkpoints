@@ -502,7 +502,8 @@ class StriimUpgradeManager:
                     namespace, app, comp['type'], comp['name'], comp['create_statement'],
                     drop_type=comp.get('component_type', 'SOURCE'),
                     flow=comp.get('flow'),
-                    simple_name=comp.get('simple_name')
+                    simple_name=comp.get('simple_name'),
+                    udfs=comp.get('udfs')  # Pass UDFs for CQ components
                 )
 
         # Save application states, deployment plans, and library files
@@ -649,9 +650,10 @@ class StriimUpgradeManager:
             full_name = f"{namespace}.{name}" if namespace else name
 
             # Determine if this is an OPEN PROCESSOR or SOURCE
-            # Look back in the match to see if it has "OPEN" keyword
-            match_text = match.group(0)
-            is_open_processor = 'OPEN' in match_text.upper()
+            # Check for the specific "OPEN SOURCE" or "OPEN PROCESSOR" keyword sequence
+            # (not just substring 'OPEN' which could match component/adapter names)
+            match_text = match.group(0).upper()
+            is_open_processor = bool(re.search(r'\bOPEN\s+(?:SOURCE|PROCESSOR)\b', match_text))
             component_type = 'OPEN PROCESSOR' if is_open_processor else 'SOURCE'
 
             # Try to find which app this belongs to (pass known position to avoid re-searching)
@@ -1360,6 +1362,160 @@ class StriimUpgradeManager:
             return create_stmt.replace('CREATE CQ', 'CREATE OR REPLACE CQ', 1)
         return create_stmt
 
+    def _is_command_failure(self, result) -> bool:
+        """Check if a Striim API result indicates a failure.
+
+        Striim can return HTTP 200 with a failureMessage in the JSON body.
+        Returns True if the result contains a failure, False if success.
+        """
+        if not result:
+            return True
+        if isinstance(result, list) and len(result) > 0 and result[0].get('failureMessage'):
+            return True
+        return False
+
+    def _get_failure_message(self, result) -> str:
+        """Extract failure message from a Striim API result."""
+        if not result:
+            return 'No response from API'
+        if isinstance(result, list) and len(result) > 0:
+            return result[0].get('failureMessage', 'Unknown error')
+        return 'Unknown error'
+
+    def _build_deploy_cmd(self, app_name: str, deployment_plans: Dict) -> Tuple[str, str, str, Dict]:
+        """Build a DEPLOY command for an application using its deployment plan.
+
+        Returns: (deploy_cmd, deploy_mode, group, flows)
+        """
+        plan = deployment_plans.get(app_name, {})
+        app_plan = plan.get('application', {})
+        flows = plan.get('flows', {})
+
+        strategy = app_plan.get('strategy', 'ON_ONE')
+        group = app_plan.get('deploymentGroup', 'default')
+
+        # Extract namespace from app_name (e.g., "DATALAKE.myapp" -> "DATALAKE")
+        app_parts = app_name.split('.')
+        namespace = '.'.join(app_parts[:-1]) if len(app_parts) > 1 else ''
+
+        # Convert strategy to command format (ON_ONE -> ONE, ON_ALL -> ALL)
+        deploy_mode = strategy.replace('ON_', '')
+
+        # Build DEPLOY command with per-flow deployment groups
+        deploy_cmd = f"DEPLOY APPLICATION {app_name} ON {deploy_mode} IN {group}"
+
+        if flows:
+            # Add WITH clause for each flow (with namespace prefix)
+            with_clauses = []
+            for flow_name, flow_plan in flows.items():
+                flow_strategy = flow_plan['strategy'].replace('ON_', '')
+                flow_group = flow_plan['deploymentGroup']
+                qualified_flow_name = f"{namespace}.{flow_name}" if namespace else flow_name
+                with_clauses.append(f"{qualified_flow_name} ON {flow_strategy} IN {flow_group}")
+            deploy_cmd += " WITH " + ", ".join(with_clauses)
+
+        deploy_cmd += ";"
+        return deploy_cmd, deploy_mode, group, flows
+
+    def _log_deploy_plan(self, app_name: str, deploy_mode: str, group: str, flows: Dict, action: str = "Deploying"):
+        """Log the deployment plan details for an application."""
+        # Extract namespace for qualified flow names
+        app_parts = app_name.split('.')
+        namespace = '.'.join(app_parts[:-1]) if len(app_parts) > 1 else ''
+
+        logger.info(f"\n{action} {app_name}...")
+        if flows:
+            logger.info(f"  App: {deploy_mode} in {group}")
+            for flow_name, flow_plan in flows.items():
+                qualified_flow_name = f"{namespace}.{flow_name}" if namespace else flow_name
+                logger.info(f"  {qualified_flow_name}: {flow_plan['strategy'].replace('ON_', '')} in {flow_plan['deploymentGroup']}")
+        else:
+            logger.info(f"  {deploy_mode} in {group}")
+
+    def _log_deploy_preview(self, label: str, app_names: List[str], deployment_plans: Dict):
+        """Log a preview of apps to be deployed/started."""
+        if not app_names:
+            return
+        logger.info(f"\n{label} ({len(app_names)}):")
+        for app_name in app_names:
+            _, _, group, flows = self._build_deploy_cmd(app_name, deployment_plans)
+            # Extract namespace for qualified flow names
+            app_parts = app_name.split('.')
+            namespace = '.'.join(app_parts[:-1]) if len(app_parts) > 1 else ''
+            strategy = deployment_plans.get(app_name, {}).get('application', {}).get('strategy', 'ON_ONE')
+            logger.info(f"  - {app_name} ({strategy} in {group})")
+            if flows:
+                for flow_name, flow_plan in flows.items():
+                    qualified_flow_name = f"{namespace}.{flow_name}" if namespace else flow_name
+                    logger.info(f"      WITH {qualified_flow_name} ({flow_plan['strategy']} in {flow_plan['deploymentGroup']})")
+
+    def _deploy_and_start_apps(self, apps_to_deploy: List[str], apps_to_start: List[str], deployment_plans: Dict):
+        """Deploy and optionally start applications using their deployment plans.
+
+        Args:
+            apps_to_deploy: Apps to deploy only (DEPLOYED state)
+            apps_to_start: Apps to deploy AND start (RUNNING state)
+            deployment_plans: Deployment plan data from analyze phase
+        """
+        # Deploy-only applications
+        for app_name in apps_to_deploy:
+            deploy_cmd, deploy_mode, group, flows = self._build_deploy_cmd(app_name, deployment_plans)
+            self._log_deploy_plan(app_name, deploy_mode, group, flows, "Deploying")
+
+            result = self.api.execute_command(deploy_cmd)
+            if self._is_command_failure(result):
+                logger.error(f"  [ERROR] Failed to deploy {app_name}: {self._get_failure_message(result)}")
+            else:
+                logger.info(f"  [OK] Deployed {app_name}")
+
+        # Deploy-and-start applications
+        for app_name in apps_to_start:
+            deploy_cmd, deploy_mode, group, flows = self._build_deploy_cmd(app_name, deployment_plans)
+            self._log_deploy_plan(app_name, deploy_mode, group, flows, "Deploying and starting")
+
+            # Deploy first
+            result = self.api.execute_command(deploy_cmd)
+            if self._is_command_failure(result):
+                logger.error(f"  [ERROR] Failed to deploy {app_name}: {self._get_failure_message(result)}")
+                continue
+            logger.info(f"  [OK] Deployed {app_name}")
+
+            # Then start
+            result = self.api.execute_command(f"START APPLICATION {app_name};")
+            if self._is_command_failure(result):
+                logger.error(f"  [ERROR] Failed to start {app_name}: {self._get_failure_message(result)}")
+            else:
+                logger.info(f"  [OK] Started {app_name}")
+
+    def _classify_app_states(self, app_states_iter) -> Tuple[List[str], List[str]]:
+        """Classify apps into deploy-only and deploy-and-start lists based on original state.
+
+        Args:
+            app_states_iter: Iterable of (app_name, original_state) tuples
+
+        Returns: (apps_to_deploy, apps_to_start)
+        """
+        apps_to_deploy = []
+        apps_to_start = []
+
+        for app_name, original_state in app_states_iter:
+            if original_state == 'DEPLOYED':
+                apps_to_deploy.append(app_name)
+            elif original_state == 'RUNNING':
+                apps_to_start.append(app_name)
+            elif original_state in ['HALTED', 'TERMINATED']:
+                # HALTED/TERMINATED apps should be restored to DEPLOYED state
+                # (they were undeployed during component removal)
+                apps_to_deploy.append(app_name)
+                logger.info(f"[INFO] {app_name} was {original_state}, will restore to DEPLOYED")
+            elif original_state == 'CREATED':
+                # Already in correct state, no action needed
+                pass
+            else:
+                logger.warning(f"[WARN] Unknown state '{original_state}' for {app_name}, skipping")
+
+        return apps_to_deploy, apps_to_start
+
     def restore_to_apps(self):
         """Restore OPs/UDFs/CQs to applications using batched commands.
 
@@ -1387,7 +1543,7 @@ class StriimUpgradeManager:
             # Check if app is deployed/running - if so, need to undeploy first
             app_state = self.state.state.get('app_states', {}).get(app_name, 'UNKNOWN')
 
-            if app_state in ['RUNNING', 'DEPLOYED']:
+            if app_state in ['RUNNING', 'DEPLOYED', 'HALTED', 'TERMINATED']:
                 if self.dry_run:
                     logger.info(f"  [DRY-RUN] Would undeploy {app_name} (currently {app_state})")
                 else:
@@ -1397,7 +1553,7 @@ class StriimUpgradeManager:
                         self.api.execute_command(f"STOP APPLICATION {app_name};")
 
                     # Undeploy
-                    logger.info(f"  Undeploying {app_name}...")
+                    logger.info(f"  Undeploying {app_name} (currently {app_state})...")
                     self.api.execute_command(f"UNDEPLOY APPLICATION {app_name};")
 
             # Group components by flow: None = app-level, flow_name = in that flow
@@ -1460,8 +1616,8 @@ class StriimUpgradeManager:
             # Execute as single batch
             result = self.api.execute_command(batch_cmd)
 
-            if result and isinstance(result, list) and len(result) > 0 and result[0].get('failureMessage'):
-                logger.error(f"  [ERROR] {result[0]['failureMessage']}")
+            if self._is_command_failure(result):
+                logger.error(f"  [ERROR] {self._get_failure_message(result)}")
                 logger.error(f"  [ERROR] Failed to restore components to {app_name}")
             else:
                 self.state.state['restored_apps'].append(app_name)
@@ -1483,7 +1639,8 @@ class StriimUpgradeManager:
         self.restore_all_app_states()
 
     def restore_app_states(self):
-        """Restore applications to their original states (DEPLOYED/RUNNING) and deployment groups"""
+        """Restore applications to their original states (DEPLOYED/RUNNING) and deployment groups.
+        Only restores apps that had custom components."""
         logger.info("\n=== Restoring Application States ===")
 
         if not self.state.state.get('app_states'):
@@ -1498,62 +1655,13 @@ class StriimUpgradeManager:
         deployment_plans = self.state.state.get('deployment_plans', {})
         apps_with_components = set(self.state.state['apps_with_components'].keys())
 
-        # Track which apps need state restoration
-        apps_to_deploy = []
-        apps_to_start = []
+        # Classify apps by target state (only those with components)
+        app_state_iter = ((name, app_states.get(name, 'UNKNOWN')) for name in apps_with_components)
+        apps_to_deploy, apps_to_start = self._classify_app_states(app_state_iter)
 
-        for app_name in apps_with_components:
-            original_state = app_states.get(app_name, 'UNKNOWN')
-
-            if original_state == 'DEPLOYED':
-                apps_to_deploy.append(app_name)
-            elif original_state == 'RUNNING':
-                apps_to_start.append(app_name)
-            elif original_state in ['HALTED', 'TERMINATED']:
-                # HALTED/TERMINATED apps should be restored to DEPLOYED state
-                # (they were undeployed during component removal)
-                apps_to_deploy.append(app_name)
-                logger.info(f"[INFO] {app_name} was {original_state}, will restore to DEPLOYED")
-            elif original_state == 'CREATED':
-                # Already in correct state, no action needed
-                pass
-            else:
-                logger.warning(f"[WARN] Unknown state '{original_state}' for {app_name}, skipping")
-
-        # Display what will be done
-        if apps_to_deploy:
-            logger.info(f"\nApplications to DEPLOY ({len(apps_to_deploy)}):")
-            for app_name in apps_to_deploy:
-                plan = deployment_plans.get(app_name, {})
-                app_plan = plan.get('application', {})
-                flows = plan.get('flows', {})
-                strategy = app_plan.get('strategy', 'ON_ONE')
-                group = app_plan.get('deploymentGroup', 'default')
-                # Extract namespace for flow names
-                app_parts = app_name.split('.')
-                namespace = '.'.join(app_parts[:-1]) if len(app_parts) > 1 else ''
-                logger.info(f"  - {app_name} ({strategy} in {group})")
-                if flows:
-                    for flow_name, flow_plan in flows.items():
-                        qualified_flow_name = f"{namespace}.{flow_name}" if namespace else flow_name
-                        logger.info(f"      WITH {qualified_flow_name} ({flow_plan['strategy']} in {flow_plan['deploymentGroup']})")
-
-        if apps_to_start:
-            logger.info(f"\nApplications to DEPLOY and START ({len(apps_to_start)}):")
-            for app_name in apps_to_start:
-                plan = deployment_plans.get(app_name, {})
-                app_plan = plan.get('application', {})
-                flows = plan.get('flows', {})
-                strategy = app_plan.get('strategy', 'ON_ONE')
-                group = app_plan.get('deploymentGroup', 'default')
-                # Extract namespace for flow names
-                app_parts = app_name.split('.')
-                namespace = '.'.join(app_parts[:-1]) if len(app_parts) > 1 else ''
-                logger.info(f"  - {app_name} ({strategy} in {group})")
-                if flows:
-                    for flow_name, flow_plan in flows.items():
-                        qualified_flow_name = f"{namespace}.{flow_name}" if namespace else flow_name
-                        logger.info(f"      WITH {qualified_flow_name} ({flow_plan['strategy']} in {flow_plan['deploymentGroup']})")
+        # Display preview
+        self._log_deploy_preview("Applications to DEPLOY", apps_to_deploy, deployment_plans)
+        self._log_deploy_preview("Applications to DEPLOY and START", apps_to_start, deployment_plans)
 
         if not apps_to_deploy and not apps_to_start:
             logger.info("\n[INFO] All applications are already in CREATED state, no action needed")
@@ -1563,113 +1671,13 @@ class StriimUpgradeManager:
             logger.info("\n[DRY-RUN] Would restore application states with deployment plans")
             return
 
-        # Deploy applications
-        for app_name in apps_to_deploy:
-            plan = deployment_plans.get(app_name, {})
-            app_plan = plan.get('application', {})
-            flows = plan.get('flows', {})
-
-            strategy = app_plan.get('strategy', 'ON_ONE')
-            group = app_plan.get('deploymentGroup', 'default')
-
-            # Extract namespace from app_name (e.g., "DATALAKE.myapp" -> "DATALAKE")
-            app_parts = app_name.split('.')
-            namespace = '.'.join(app_parts[:-1]) if len(app_parts) > 1 else ''
-
-            # Convert strategy to command format (ON_ONE -> ONE, ON_ALL -> ALL)
-            deploy_mode = strategy.replace('ON_', '')
-
-            # Build DEPLOY command with per-flow deployment groups
-            deploy_cmd = f"DEPLOY APPLICATION {app_name} ON {deploy_mode} IN {group}"
-
-            if flows:
-                # Add WITH clause for each flow (with namespace prefix)
-                with_clauses = []
-                for flow_name, flow_plan in flows.items():
-                    flow_strategy = flow_plan['strategy'].replace('ON_', '')
-                    flow_group = flow_plan['deploymentGroup']
-                    # Prepend namespace to flow name if namespace exists
-                    qualified_flow_name = f"{namespace}.{flow_name}" if namespace else flow_name
-                    with_clauses.append(f"{qualified_flow_name} ON {flow_strategy} IN {flow_group}")
-                deploy_cmd += " WITH " + ", ".join(with_clauses)
-
-            deploy_cmd += ";"
-
-            logger.info(f"\nDeploying {app_name}...")
-            if flows:
-                logger.info(f"  App: {deploy_mode} in {group}")
-                for flow_name, flow_plan in flows.items():
-                    qualified_flow_name = f"{namespace}.{flow_name}" if namespace else flow_name
-                    logger.info(f"  {qualified_flow_name}: {flow_plan['strategy'].replace('ON_', '')} in {flow_plan['deploymentGroup']}")
-            else:
-                logger.info(f"  {deploy_mode} in {group}")
-
-            result = self.api.execute_command(deploy_cmd)
-            if result:
-                logger.info(f"  [OK] Deployed {app_name}")
-            else:
-                logger.error(f"  [ERROR] Failed to deploy {app_name}")
-
-        # Deploy and start applications
-        for app_name in apps_to_start:
-            plan = deployment_plans.get(app_name, {})
-            app_plan = plan.get('application', {})
-            flows = plan.get('flows', {})
-
-            strategy = app_plan.get('strategy', 'ON_ONE')
-            group = app_plan.get('deploymentGroup', 'default')
-
-            # Extract namespace from app_name (e.g., "DATALAKE.myapp" -> "DATALAKE")
-            app_parts = app_name.split('.')
-            namespace = '.'.join(app_parts[:-1]) if len(app_parts) > 1 else ''
-
-            # Convert strategy to command format (ON_ONE -> ONE, ON_ALL -> ALL)
-            deploy_mode = strategy.replace('ON_', '')
-
-            # Build DEPLOY command with per-flow deployment groups
-            deploy_cmd = f"DEPLOY APPLICATION {app_name} ON {deploy_mode} IN {group}"
-
-            if flows:
-                # Add WITH clause for each flow (with namespace prefix)
-                with_clauses = []
-                for flow_name, flow_plan in flows.items():
-                    flow_strategy = flow_plan['strategy'].replace('ON_', '')
-                    flow_group = flow_plan['deploymentGroup']
-                    # Prepend namespace to flow name if namespace exists
-                    qualified_flow_name = f"{namespace}.{flow_name}" if namespace else flow_name
-                    with_clauses.append(f"{qualified_flow_name} ON {flow_strategy} IN {flow_group}")
-                deploy_cmd += " WITH " + ", ".join(with_clauses)
-
-            deploy_cmd += ";"
-
-            logger.info(f"\nDeploying and starting {app_name}...")
-            if flows:
-                logger.info(f"  App: {deploy_mode} in {group}")
-                for flow_name, flow_plan in flows.items():
-                    qualified_flow_name = f"{namespace}.{flow_name}" if namespace else flow_name
-                    logger.info(f"  {qualified_flow_name}: {flow_plan['strategy'].replace('ON_', '')} in {flow_plan['deploymentGroup']}")
-            else:
-                logger.info(f"  {deploy_mode} in {group}")
-
-            # Deploy first
-            result = self.api.execute_command(deploy_cmd)
-            if not result:
-                logger.error(f"  [ERROR] Failed to deploy {app_name}")
-                continue
-            logger.info(f"  [OK] Deployed {app_name}")
-
-            # Then start
-            result = self.api.execute_command(f"START APPLICATION {app_name};")
-            if result:
-                logger.info(f"  [OK] Started {app_name}")
-            else:
-                logger.error(f"  [ERROR] Failed to start {app_name}")
+        self._deploy_and_start_apps(apps_to_deploy, apps_to_start, deployment_plans)
 
         self.state.set_phase('states_restored')
         logger.info("\n[OK] Application states restored")
 
     def restore_all_app_states(self):
-        """Restore ALL applications to their original states (DEPLOYED/RUNNING), not just those with components
+        """Restore ALL applications to their original states (DEPLOYED/RUNNING), not just those with components.
 
         This is useful when you want to restore the entire environment state after an upgrade,
         regardless of whether apps had custom components.
@@ -1683,59 +1691,12 @@ class StriimUpgradeManager:
         app_states = self.state.state['app_states']
         deployment_plans = self.state.state.get('deployment_plans', {})
 
-        # Track which apps need state restoration (ALL apps, not just those with components)
-        apps_to_deploy = []
-        apps_to_start = []
+        # Classify ALL apps by target state
+        apps_to_deploy, apps_to_start = self._classify_app_states(app_states.items())
 
-        for app_name, original_state in app_states.items():
-            if original_state == 'DEPLOYED':
-                apps_to_deploy.append(app_name)
-            elif original_state == 'RUNNING':
-                apps_to_start.append(app_name)
-            elif original_state in ['HALTED', 'TERMINATED']:
-                # HALTED/TERMINATED apps should be restored to DEPLOYED state
-                apps_to_deploy.append(app_name)
-                logger.info(f"[INFO] {app_name} was {original_state}, will restore to DEPLOYED")
-            elif original_state == 'CREATED':
-                # Already in correct state, no action needed
-                pass
-            else:
-                logger.warning(f"[WARN] Unknown state '{original_state}' for {app_name}, skipping")
-
-        # Display what will be done
-        if apps_to_deploy:
-            logger.info(f"\nApplications to DEPLOY ({len(apps_to_deploy)}):")
-            for app_name in apps_to_deploy:
-                plan = deployment_plans.get(app_name, {})
-                app_plan = plan.get('application', {})
-                flows = plan.get('flows', {})
-                strategy = app_plan.get('strategy', 'ON_ONE')
-                group = app_plan.get('deploymentGroup', 'default')
-                # Extract namespace for flow names
-                app_parts = app_name.split('.')
-                namespace = '.'.join(app_parts[:-1]) if len(app_parts) > 1 else ''
-                logger.info(f"  - {app_name} ({strategy} in {group})")
-                if flows:
-                    for flow_name, flow_plan in flows.items():
-                        qualified_flow_name = f"{namespace}.{flow_name}" if namespace else flow_name
-                        logger.info(f"      WITH {qualified_flow_name} ({flow_plan['strategy']} in {flow_plan['deploymentGroup']})")
-
-        if apps_to_start:
-            logger.info(f"\nApplications to DEPLOY and START ({len(apps_to_start)}):")
-            for app_name in apps_to_start:
-                plan = deployment_plans.get(app_name, {})
-                app_plan = plan.get('application', {})
-                flows = plan.get('flows', {})
-                strategy = app_plan.get('strategy', 'ON_ONE')
-                group = app_plan.get('deploymentGroup', 'default')
-                # Extract namespace for flow names
-                app_parts = app_name.split('.')
-                namespace = '.'.join(app_parts[:-1]) if len(app_parts) > 1 else ''
-                logger.info(f"  - {app_name} ({strategy} in {group})")
-                if flows:
-                    for flow_name, flow_plan in flows.items():
-                        qualified_flow_name = f"{namespace}.{flow_name}" if namespace else flow_name
-                        logger.info(f"      WITH {qualified_flow_name} ({flow_plan['strategy']} in {flow_plan['deploymentGroup']})")
+        # Display preview
+        self._log_deploy_preview("Applications to DEPLOY", apps_to_deploy, deployment_plans)
+        self._log_deploy_preview("Applications to DEPLOY and START", apps_to_start, deployment_plans)
 
         if not apps_to_deploy and not apps_to_start:
             logger.info("\n[INFO] All applications are already in CREATED state, no action needed")
@@ -1745,107 +1706,7 @@ class StriimUpgradeManager:
             logger.info("\n[DRY-RUN] Would restore application states with deployment plans")
             return
 
-        # Deploy applications
-        for app_name in apps_to_deploy:
-            plan = deployment_plans.get(app_name, {})
-            app_plan = plan.get('application', {})
-            flows = plan.get('flows', {})
-
-            strategy = app_plan.get('strategy', 'ON_ONE')
-            group = app_plan.get('deploymentGroup', 'default')
-
-            # Extract namespace from app_name (e.g., "DATALAKE.myapp" -> "DATALAKE")
-            app_parts = app_name.split('.')
-            namespace = '.'.join(app_parts[:-1]) if len(app_parts) > 1 else ''
-
-            # Convert strategy to command format (ON_ONE -> ONE, ON_ALL -> ALL)
-            deploy_mode = strategy.replace('ON_', '')
-
-            # Build DEPLOY command with per-flow deployment groups
-            deploy_cmd = f"DEPLOY APPLICATION {app_name} ON {deploy_mode} IN {group}"
-
-            if flows:
-                # Add WITH clause for each flow (with namespace prefix)
-                with_clauses = []
-                for flow_name, flow_plan in flows.items():
-                    flow_strategy = flow_plan['strategy'].replace('ON_', '')
-                    flow_group = flow_plan['deploymentGroup']
-                    # Prepend namespace to flow name if namespace exists
-                    qualified_flow_name = f"{namespace}.{flow_name}" if namespace else flow_name
-                    with_clauses.append(f"{qualified_flow_name} ON {flow_strategy} IN {flow_group}")
-                deploy_cmd += " WITH " + ", ".join(with_clauses)
-
-            deploy_cmd += ";"
-
-            logger.info(f"\nDeploying {app_name}...")
-            if flows:
-                logger.info(f"  App: {deploy_mode} in {group}")
-                for flow_name, flow_plan in flows.items():
-                    qualified_flow_name = f"{namespace}.{flow_name}" if namespace else flow_name
-                    logger.info(f"  {qualified_flow_name}: {flow_plan['strategy'].replace('ON_', '')} in {flow_plan['deploymentGroup']}")
-            else:
-                logger.info(f"  {deploy_mode} in {group}")
-
-            result = self.api.execute_command(deploy_cmd)
-            if result:
-                logger.info(f"  [OK] Deployed {app_name}")
-            else:
-                logger.error(f"  [ERROR] Failed to deploy {app_name}")
-
-        # Deploy and start applications
-        for app_name in apps_to_start:
-            plan = deployment_plans.get(app_name, {})
-            app_plan = plan.get('application', {})
-            flows = plan.get('flows', {})
-
-            strategy = app_plan.get('strategy', 'ON_ONE')
-            group = app_plan.get('deploymentGroup', 'default')
-
-            # Extract namespace from app_name (e.g., "DATALAKE.myapp" -> "DATALAKE")
-            app_parts = app_name.split('.')
-            namespace = '.'.join(app_parts[:-1]) if len(app_parts) > 1 else ''
-
-            # Convert strategy to command format (ON_ONE -> ONE, ON_ALL -> ALL)
-            deploy_mode = strategy.replace('ON_', '')
-
-            # Build DEPLOY command with per-flow deployment groups
-            deploy_cmd = f"DEPLOY APPLICATION {app_name} ON {deploy_mode} IN {group}"
-
-            if flows:
-                # Add WITH clause for each flow (with namespace prefix)
-                with_clauses = []
-                for flow_name, flow_plan in flows.items():
-                    flow_strategy = flow_plan['strategy'].replace('ON_', '')
-                    flow_group = flow_plan['deploymentGroup']
-                    # Prepend namespace to flow name if namespace exists
-                    qualified_flow_name = f"{namespace}.{flow_name}" if namespace else flow_name
-                    with_clauses.append(f"{qualified_flow_name} ON {flow_strategy} IN {flow_group}")
-                deploy_cmd += " WITH " + ", ".join(with_clauses)
-
-            deploy_cmd += ";"
-
-            logger.info(f"\nDeploying and starting {app_name}...")
-            if flows:
-                logger.info(f"  App: {deploy_mode} in {group}")
-                for flow_name, flow_plan in flows.items():
-                    qualified_flow_name = f"{namespace}.{flow_name}" if namespace else flow_name
-                    logger.info(f"  {qualified_flow_name}: {flow_plan['strategy'].replace('ON_', '')} in {flow_plan['deploymentGroup']}")
-            else:
-                logger.info(f"  {deploy_mode} in {group}")
-
-            # Deploy first
-            result = self.api.execute_command(deploy_cmd)
-            if not result:
-                logger.error(f"  [ERROR] Failed to deploy {app_name}")
-                continue
-            logger.info(f"  [OK] Deployed {app_name}")
-
-            # Then start
-            result = self.api.execute_command(f"START APPLICATION {app_name};")
-            if result:
-                logger.info(f"  [OK] Started {app_name}")
-            else:
-                logger.error(f"  [ERROR] Failed to start {app_name}")
+        self._deploy_and_start_apps(apps_to_deploy, apps_to_start, deployment_plans)
 
         self.state.set_phase('all_states_restored')
         logger.info("\n[OK] All application states restored")
