@@ -1032,8 +1032,8 @@ class StriimUpgradeManager:
 
                 result = self.api.execute_command(batch_cmd)
 
-                if result and isinstance(result, list) and len(result) > 0 and result[0].get('failureMessage'):
-                    logger.error(f"    [ERROR] {result[0]['failureMessage']}")
+                if self._is_command_failure(result):
+                    logger.error(f"    [ERROR] {self._get_failure_message(result)}")
                     logger.error(f"  [ERROR] Failed to remove {comp_name}")
                 else:
                     self.state.state['removed_components'].setdefault(app_name, []).append(comp_name)
