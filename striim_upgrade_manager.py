@@ -612,7 +612,6 @@ class StriimUpgradeManager:
         # First part must be lowercase (package), subsequent parts can be any case (class/method names)
         udf_call_pattern = r'\b([a-z][a-z0-9]*(?:\.[a-zA-Z][a-zA-Z0-9]*){2,})\s*\('
         app_pattern = r'CREATE\s+(?:OR\s+REPLACE\s+)?APPLICATION\s+(?:(\w+)\.)?(\w+)'
-        cq_pattern = r'CREATE\s+(?:OR\s+REPLACE\s+)?CQ\s+(?:(\w+)\.)?(\w+)'
 
         # Find all applications first
         apps_found = set()
@@ -655,8 +654,8 @@ class StriimUpgradeManager:
             is_open_processor = 'OPEN' in match_text.upper()
             component_type = 'OPEN PROCESSOR' if is_open_processor else 'SOURCE'
 
-            # Try to find which app this belongs to
-            app_name = self._find_app_for_component(tql_content, namespace, name, apps_found)
+            # Try to find which app this belongs to (pass known position to avoid re-searching)
+            app_name = self._find_app_for_component(tql_content, namespace, name, apps_found, match.start())
             if app_name:
                 # Find which flow (if any) this component belongs to
                 flow_name = self._find_flow_for_component(tql_content, match.start())
@@ -698,7 +697,7 @@ class StriimUpgradeManager:
 
             # Process each CQ found
             for cq_info in cq_infos:
-                app_name, cq_name, cq_statement = cq_info
+                app_name, cq_name, cq_statement, cq_position = cq_info
                 if app_name not in components:
                     components[app_name] = []
 
@@ -716,10 +715,8 @@ class StriimUpgradeManager:
                     if udf_name not in existing_cq['udfs']:
                         existing_cq['udfs'].append(udf_name)
                 else:
-                    # Find CQ position in TQL to determine which flow it's in
-                    cq_pattern = rf'CREATE\s+(?:OR\s+REPLACE\s+)?CQ\s+(?:\w+\.)?{re.escape(cq_name.split(".")[-1])}'
-                    cq_match = re.search(cq_pattern, tql_content, re.IGNORECASE)
-                    cq_position = cq_match.start() if cq_match else 0
+                    # Use the exact CQ position returned by _find_cq_for_udf
+                    # instead of re-searching (which could find a different match)
                     flow_name = self._find_flow_for_component(tql_content, cq_position)
 
                     # Create new CQ entry
@@ -743,15 +740,22 @@ class StriimUpgradeManager:
         CREATE [OR REPLACE] SOURCE name USING library ( properties ) OUTPUT TO target;
 
         We need to find the matching closing ) for the properties, then find the ; after that.
+
+        For CQ statements (which may have no parentheses in their body), we must check
+        if a semicolon appears before the first parenthesis — if so, the statement ends
+        at that semicolon rather than extending into the next statement's parentheses.
         """
         # Find the opening parenthesis for the properties section
         paren_start = tql.find('(', start_pos)
-        if paren_start == -1:
-            # No parentheses, just find the semicolon
-            end_pos = tql.find(';', start_pos)
-            if end_pos == -1:
-                end_pos = len(tql)
-            return tql[start_pos:end_pos+1].strip()
+        semi_pos = tql.find(';', start_pos)
+
+        if paren_start == -1 or (semi_pos != -1 and semi_pos < paren_start):
+            # No parentheses, OR semicolon comes before the first parenthesis
+            # (e.g., CQ without function calls: CREATE CQ x INSERT INTO y SELECT col FROM z;)
+            # The statement ends at the semicolon
+            if semi_pos == -1:
+                semi_pos = len(tql)
+            return tql[start_pos:semi_pos+1].strip()
 
         # Count parentheses to find the matching closing one
         paren_count = 0
@@ -866,9 +870,11 @@ class StriimUpgradeManager:
 
         return deployment_plans
 
-    def _find_cq_for_udf(self, tql: str, udf_name: str, apps_found: Set[str]) -> List[Tuple[str, str, str]]:
+    def _find_cq_for_udf(self, tql: str, udf_name: str, apps_found: Set[str]) -> List[Tuple[str, str, str, int]]:
         """Find ALL CQs that contain a UDF call and which app they belong to
-        Returns: List of (app_name, cq_name, cq_statement) tuples
+        Returns: List of (app_name, cq_name, cq_statement, cq_position) tuples
+        The cq_position is the character offset of the CREATE CQ in the TQL, used for
+        accurate flow detection without needing to re-search.
         """
         # Pattern to find CQ statements
         # Match CQ body up to single semicolon (not double)
@@ -882,12 +888,12 @@ class StriimUpgradeManager:
             if udf_name in cq_body:
                 # Find which app this CQ belongs to
                 full_cq_name = f"{namespace}.{cq_name}" if namespace else cq_name
-                app_name = self._find_app_for_component(tql, namespace, cq_name, apps_found)
+                app_name = self._find_app_for_component(tql, namespace, cq_name, apps_found, match.start())
 
                 if app_name:
                     # Extract the full CQ statement
                     cq_statement = self._extract_full_statement(tql, match.start())
-                    cqs_found.append((app_name, full_cq_name, cq_statement))
+                    cqs_found.append((app_name, full_cq_name, cq_statement, match.start()))
 
         return cqs_found
 
@@ -911,19 +917,29 @@ class StriimUpgradeManager:
 
         return None
 
-    def _find_app_for_component(self, tql: str, namespace: Optional[str], comp_name: str, apps_found: Set[str]) -> Optional[str]:
-        """Find which application a component belongs to"""
-        # Look for the component in the TQL (with or without namespace)
-        if namespace:
-            comp_pattern = rf'\b(?:{namespace}\.)?{comp_name}\b'
-        else:
-            comp_pattern = rf'\b{comp_name}\b'
+    def _find_app_for_component(self, tql: str, namespace: Optional[str], comp_name: str, apps_found: Set[str], comp_pos: int = -1) -> Optional[str]:
+        """Find which application a component belongs to
 
-        comp_match = re.search(comp_pattern, tql, re.IGNORECASE)
-        if not comp_match:
-            return None
+        Args:
+            tql: Full TQL content
+            namespace: Component namespace (if any)
+            comp_name: Component name
+            apps_found: Set of known app names (unused, kept for API compatibility)
+            comp_pos: Known character position of the component in the TQL.
+                      If provided (>= 0), uses this directly instead of re-searching.
+                      This avoids finding the wrong match when a name appears multiple times.
+        """
+        # Use the known position if provided, otherwise search for the component
+        if comp_pos < 0:
+            if namespace:
+                comp_pattern = rf'\b(?:{namespace}\.)?{comp_name}\b'
+            else:
+                comp_pattern = rf'\b{comp_name}\b'
 
-        comp_pos = comp_match.start()
+            comp_match = re.search(comp_pattern, tql, re.IGNORECASE)
+            if not comp_match:
+                return None
+            comp_pos = comp_match.start()
 
         # Find all app declarations before this position
         app_pattern = r'CREATE\s+(?:OR\s+REPLACE\s+)?APPLICATION\s+(?:(\w+)\.)?(\w+)'
