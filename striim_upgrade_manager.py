@@ -335,8 +335,17 @@ class StriimUpgradeManager:
         else:
             components_found = self._analyze_zip_for_components(export_path, passphrase, custom_libraries)
 
+        # Preserve component definitions for apps already in removed_components
+        # (their components are already gone, so re-analyze won't find them)
+        preserved = {}
+        removed = self.state.state.get('removed_components', {})
+        for app_name, comps in self.state.state.get('apps_with_components', {}).items():
+            if app_name in removed and comps:
+                preserved[app_name] = comps
+                logger.info(f"  [PRESERVE] Keeping saved definitions for {app_name} (already removed)")
+
         # Clear existing component data before saving new analysis
-        self.state.state['apps_with_components'] = {}
+        self.state.state['apps_with_components'] = dict(preserved)
 
         # Save to state
         for app_name, components in components_found.items():
@@ -489,8 +498,17 @@ class StriimUpgradeManager:
         # Extract and parse TQL files from zip
         components_found = self._analyze_zip_for_components(export_path, passphrase, custom_libraries)
 
+        # Preserve component definitions for apps already in removed_components
+        # (their components are already gone, so re-analyze won't find them)
+        preserved = {}
+        removed = self.state.state.get('removed_components', {})
+        for app_name, comps in self.state.state.get('apps_with_components', {}).items():
+            if app_name in removed and comps:
+                preserved[app_name] = comps
+                logger.info(f"  [PRESERVE] Keeping saved definitions for {app_name} (already removed)")
+
         # Clear existing component data before saving new analysis
-        self.state.state['apps_with_components'] = {}
+        self.state.state['apps_with_components'] = dict(preserved)
 
         # Save to state
         for app_name, components in components_found.items():
@@ -971,6 +989,15 @@ class StriimUpgradeManager:
         for app_name, components in self.state.state['apps_with_components'].items():
             logger.info(f"\nProcessing {app_name}...")
 
+            # Safety check: refuse to drop components that have no create_statement
+            # Without it, we cannot restore the component after removal
+            missing_stmt = [c for c in components if not c.get('create_statement')]
+            if missing_stmt:
+                names = ', '.join(c['name'] for c in missing_stmt)
+                logger.error(f"  [SAFETY] Refusing to remove components without create_statement: {names}")
+                logger.error(f"  [SAFETY] Re-run --analyze first to capture component definitions")
+                continue
+
             # Check app state - if RUNNING, need to STOP first, then UNDEPLOY
             app_state = self.state.state.get('app_states', {}).get(app_name, 'UNKNOWN')
 
@@ -1036,7 +1063,9 @@ class StriimUpgradeManager:
                     logger.error(f"    [ERROR] {self._get_failure_message(result)}")
                     logger.error(f"  [ERROR] Failed to remove {comp_name}")
                 else:
-                    self.state.state['removed_components'].setdefault(app_name, []).append(comp_name)
+                    removed_list = self.state.state['removed_components'].setdefault(app_name, [])
+                    if comp_name not in removed_list:
+                        removed_list.append(comp_name)
                     logger.info(f"  [OK] Removed {comp_name}")
 
         if not self.dry_run:
