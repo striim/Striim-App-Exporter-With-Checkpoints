@@ -48,6 +48,7 @@ import os
 import zipfile
 import tempfile
 import logging
+import time
 from typing import Dict, Optional, List, Tuple, Set
 from pathlib import Path
 from datetime import datetime
@@ -205,7 +206,10 @@ class StriimAPI:
         try:
             response = requests.post(api_url, headers=headers, data=command, verify=False)
             response.raise_for_status()
-            return response.json()
+            result = response.json()
+            # Throttle API calls to avoid overwhelming Striim
+            time.sleep(0.3)
+            return result
         except Exception as e:
             logger.error(f"[ERROR] Command failed: {e}")
             # Try to get more details from the response
@@ -920,11 +924,17 @@ class StriimUpgradeManager:
     def _find_flow_for_component(self, tql: str, comp_position: int) -> Optional[str]:
         """Find which FLOW (if any) a component belongs to
 
-        Returns the flow name if the component is inside a CREATE FLOW ... END FLOW block,
-        otherwise returns None (component is at application level)
+        Returns the flow name if the component is inside a CREATE FLOW ... END FLOW block
+        or an ALTER FLOW ... END FLOW block, otherwise returns None (component is at
+        application level).
+
+        TQL apps can split a single flow across multiple blocks:
+          CREATE FLOW X; ... END FLOW X;   (first part)
+          ALTER FLOW X;  ... END FLOW X;   (continuation)
+        Both must be detected.
         """
-        # Find all FLOW blocks
-        flow_pattern = r'CREATE\s+FLOW\s+(\w+)\s*;?(.*?)END\s+FLOW\s+\1\s*;?'
+        # Find all FLOW blocks (both CREATE FLOW and ALTER FLOW)
+        flow_pattern = r'(?:CREATE|ALTER)\s+FLOW\s+(\w+)\s*;?(.*?)END\s+FLOW\s+\1\s*;?'
 
         for match in re.finditer(flow_pattern, tql, re.IGNORECASE | re.DOTALL):
             flow_name = match.group(1)
